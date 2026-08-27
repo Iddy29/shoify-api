@@ -1,4 +1,3 @@
-
 shopify_checker.py - Updated with fixes
 import logging
 import json
