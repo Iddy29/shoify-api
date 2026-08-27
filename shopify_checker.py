@@ -1,4 +1,5 @@
-# shopify_checker.py - Updated with fixes
+
+shopify_checker.py - Updated with fixes
 import logging
 import json
 import asyncio
