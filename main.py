@@ -679,18 +679,35 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
 
     tl = (text + (code or '') + (error_message or '')).lower()
 
-    LIVE_KEYWORDS = ['insuff', 'funds', 'do_not_honor', 'generic_decline', 'card_velocity', 'try_again_later', 'not_permitted', 'fraudulent', 'security_violation', 'restricted_card', 'pickup_card', 'lost_card', 'stolen_card', 'issuer_not_available', 'processing_error', 'approve_with_id', 'call_issuer']
+    # Check for expired card FIRST (before live keywords)
+    if any(k in tl for k in ['expired', 'card_expired', 'invalid_expiry']):
+        return running_total, "Declined - Card Expired", gw_name, {'amount': running_total}
+    
+    # Check for invalid card number
+    if any(k in tl for k in ['invalid_number', 'incorrect_number', 'invalid_card_number']):
+        return running_total, "Declined - Invalid Card Number", gw_name, {'amount': running_total}
+    
+    # Check for invalid CVV
+    if any(k in tl for k in ['invalid_cvc', 'incorrect_cvc', 'invalid_cvv', 'incorrect_cvv']):
+        return running_total, "Declined - Invalid CVV", gw_name, {'amount': running_total}
+
+    LIVE_KEYWORDS = ['insufficient_funds', 'insufficient funds', 'do_not_honor', 'generic_decline', 'card_velocity', 'try_again_later', 'not_permitted', 'fraudulent', 'security_violation', 'restricted_card', 'pickup_card', 'lost_card', 'stolen_card', 'issuer_not_available', 'processing_error', 'approve_with_id', 'call_issuer']
     if any(k in tl for k in LIVE_KEYWORDS):
         return running_total, f"CCN Live - {code or 'Declined'}", gw_name, {'amount': running_total}
     if any(k in tl for k in ['invalid_cvc', 'incorrect_cvc']):
         return running_total, "CCN Live - Invalid CVV", gw_name, {'amount': running_total}
     if 'zip' in tl and ('invalid' in tl or 'incorrect' in tl):
         return running_total, "CCN Live - Invalid ZIP", gw_name, {'amount': running_total}
-    if any(k in tl for k in ['expired', 'card_expired']):
-        return running_total, "Declined - Card Expired", gw_name, {'amount': running_total}
 
-    # Card reached the bank = card is LIVE
-    return running_total, f"CCN Live - {code or 'Declined by Bank'}", gw_name, {'amount': running_total}
+    # If we have a specific bank code, return it
+    if code:
+        return running_total, f"Declined - {code}", gw_name, {'amount': running_total}
+    
+    # If no code and no recognizable response, return unknown (not fake "live")
+    if error_message:
+        return running_total, f"Declined - {error_message[:60]}", gw_name, {'amount': running_total}
+    
+    return running_total, "Declined - Unknown Bank Response", gw_name, {'amount': running_total}
 
 
 def _build_selected_delivery(delivery_strategy, addr_block, phone):
@@ -778,6 +795,18 @@ async def check(req: CheckRequest):
     if len(req.yy) == 4:
         req.yy = req.yy[2:]
     req.mm = req.mm.zfill(2)
+    
+    # Check if card is expired (don't send expired cards to Shopify)
+    import datetime
+    try:
+        card_year = int(f"20{req.yy}")
+        card_month = int(req.mm)
+        now = datetime.datetime.now()
+        if card_year < now.year or (card_year == now.year and card_month < now.month):
+            return {"status": "declined", "response": "Declined - Card Expired", "gateway": "Shopify Payments", "amount": None, "site": None, "elapsed": 0, "confidence": 100, "explanation": "Card expiry date is in the past", "card_type": "", "card_bin": req.cc[:6], "card_last4": req.cc[-4:]}
+    except Exception:
+        pass
+    
     result = await check_card(req.cc, req.mm, req.yy, req.cvv, site=req.site, proxy=req.proxy)
     return result
 
