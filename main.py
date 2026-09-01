@@ -506,8 +506,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
 
     # Tokenize card
     year_full = f"20{yy}" if len(yy) == 2 else yy
-    formatted_card = " ".join([cc[i:i+4] for i in range(0, len(cc), 4)])
-    token_payload = {"credit_card": {"month": mm, "name": f"{first} {last}", "number": formatted_card, "verification_value": cvv, "year": year_full}, "payment_session_scope": domain}
+    token_payload = {"credit_card": {"month": mm, "name": f"{first} {last}", "number": cc, "verification_value": cvv, "year": year_full}, "payment_session_scope": domain}
 
     try:
         async with session.post('https://deposit.shopifycs.com/sessions', json=token_payload, headers={'Content-Type': 'application/json', 'User-Agent': UA}, timeout=aiohttp.ClientTimeout(total=6)) as resp:
@@ -684,7 +683,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         return running_total, "Declined - Card Expired", gw_name, {'amount': running_total}
     
     # Check for invalid card number
-    if any(k in tl for k in ['invalid_number', 'incorrect_number', 'invalid_card_number']):
+    if any(k in tl for k in ['invalid_number', 'incorrect_number', 'invalid_card_number', 'credit_card_number_invalid_format', 'number_invalid_format']):
         return running_total, "Declined - Invalid Card Number", gw_name, {'amount': running_total}
     
     # Check for invalid CVV
