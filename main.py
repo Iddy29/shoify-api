@@ -795,16 +795,16 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
     else:
         sites = SHOPIFY_SITES.copy()
         random.shuffle(sites)
-        sites = sites[:6]
+        sites = sites[:10]
 
     for s in sites:
         logger.info(f"Checking {card_short} on {s} proxy={proxy_url is not None}")
         try:
-            kw = {"timeout": aiohttp.ClientTimeout(total=20), "connector": aiohttp.TCPConnector(ssl=False)}
+            kw = {"timeout": aiohttp.ClientTimeout(total=25), "connector": aiohttp.TCPConnector(ssl=False)}
             if proxy_url:
                 kw["proxy"] = proxy_url
             async with aiohttp.ClientSession(**kw) as session:
-                result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=25)
+                result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=30)
                 amount, response, gw_name = result[0], result[1], result[2]
                 extra = result[3] if len(result) > 3 else None
                 elapsed = round(time.time() - start, 2)
