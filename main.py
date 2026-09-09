@@ -783,6 +783,8 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
                 proxy_url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
             elif len(parts) == 2:
                 proxy_url = f"http://{parts[0]}:{parts[1]}"
+    
+    logger.info(f"[CHECK] card={card_short} site={site} proxy={'YES' if proxy_url else 'NO'} proxy_url={proxy_url[:30] if proxy_url else 'None'}...")
 
     def _is_skip(resp):
         skip = ["No products", "No session", "No shipping", "Checkpoint", "login", "password", "Throttled", "Gateway Error", "Negotiation", "Processing error", "No receipt", "Invalid card", "Failed to"]
