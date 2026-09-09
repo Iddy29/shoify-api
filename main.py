@@ -795,7 +795,7 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
     else:
         sites = SHOPIFY_SITES.copy()
         random.shuffle(sites)
-        sites = sites[:10]
+        sites = sites[:6]
 
     for s in sites:
         logger.info(f"Checking {card_short} on {s} proxy={proxy_url is not None}")
