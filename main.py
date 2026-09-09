@@ -798,11 +798,11 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
     for s in sites:
         logger.info(f"Checking {card_short} on {s} proxy={proxy_url is not None}")
         try:
-            kw = {"timeout": aiohttp.ClientTimeout(total=15), "connector": aiohttp.TCPConnector(ssl=False)}
+            kw = {"timeout": aiohttp.ClientTimeout(total=20), "connector": aiohttp.TCPConnector(ssl=False)}
             if proxy_url:
                 kw["proxy"] = proxy_url
             async with aiohttp.ClientSession(**kw) as session:
-                result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=18)
+                result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=25)
                 amount, response, gw_name = result[0], result[1], result[2]
                 extra = result[3] if len(result) > 3 else None
                 elapsed = round(time.time() - start, 2)
@@ -813,7 +813,37 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
                 if _is_fake_gateway(gw_name):
                     continue
 
-                return {"status": "ok", "response": response, "gateway": gw_name, "amount": amount, "site": s, "elapsed": elapsed, "extra": extra}
+                # Build response with confidence and explanation
+                resp_lower = (response or "").lower()
+                confidence = 100
+                if "charged" in resp_lower:
+                    confidence = 100
+                    explanation = "Card was successfully charged."
+                elif "ccn live" in resp_lower or "3ds" in resp_lower:
+                    confidence = 100
+                    explanation = "Card is LIVE - bank responded with a real decline code."
+                elif "declined" in resp_lower:
+                    confidence = 80
+                    explanation = "Card was declined by the bank or payment processor."
+                elif "error" in resp_lower:
+                    confidence = 50
+                    explanation = "Payment processing error - card may or may not be valid."
+                else:
+                    confidence = 60
+                    explanation = "Unclear bank response."
+
+                # Determine card type
+                card_type = "Unknown"
+                if cc.startswith("4"):
+                    card_type = "Visa"
+                elif cc[:2] in ("51", "52", "53", "54", "55") or 2221 <= int(cc[:4]) <= 2720:
+                    card_type = "Mastercard"
+                elif cc[:2] in ("34", "37"):
+                    card_type = "Amex"
+                elif cc[:4] in ("6011", "6221", "6229") or cc[:2] == "65":
+                    card_type = "Discover"
+
+                return {"status": "ok" if amount else "ok", "response": response, "gateway": gw_name, "amount": amount, "site": s, "elapsed": elapsed, "extra": extra, "confidence": confidence, "explanation": explanation, "card_type": card_type, "card_bin": cc[:6], "card_last4": cc[-4:]}
         except asyncio.TimeoutError:
             logger.info(f"TIMEOUT {s}")
             continue
