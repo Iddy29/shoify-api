@@ -540,8 +540,19 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         pass
 
-    # Submit order — use EXACT same delivery as step 2 negotiate
-    submit_delivery = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
+    # Submit order — try with minimal delivery (let Shopify use negotiated defaults)
+    submit_delivery = {
+        'deliveryLines': [{
+            'destination': {'streetAddress': addr_block},
+            'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}},
+            'targetMerchandiseLines': {'any': True},
+            'deliveryMethodTypes': ['SHIPPING'],
+            'expectedTotalPrice': {'any': True},
+            'destinationChanged': False,
+        }],
+        'noDeliveryRequired': [], 'useProgressiveRates': False,
+        'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
+    }
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
     checkout_token = re.search(r'/checkouts/cn/([^/]+)', checkout_url)
     attempt_token = checkout_token.group(1) if checkout_token else checkout_url.split('/')[-1].split('?')[0]
