@@ -467,8 +467,14 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
                 logger.info(f"[NEGOTIATE] del_type={del_type} strategy={delivery_strategy} pmi={api_pmi} gw={api_gw} payment={sp1.get('payment', {}).get('__typename', '?')}")
                 if api_pmi and not payment_method_id: payment_method_id = api_pmi
                 if api_gw: gw_name = api_gw
-                if delivery_strategy and del_type == 'FilledDeliveryTerms':
+                # Only break when we have BOTH delivery strategy AND payment method
+                if delivery_strategy and del_type == 'FilledDeliveryTerms' and (payment_method_id or api_pmi):
+                    if not payment_method_id:
+                        payment_method_id = api_pmi
                     break
+                # If we have delivery but no payment, keep negotiating
+                if delivery_strategy and del_type == 'FilledDeliveryTerms' and not api_pmi:
+                    logger.info(f"[NEGOTIATE] Have delivery but no payment method, continuing negotiate...")
                 await asyncio.sleep(0.5)
 
             if delivery_strategy:
@@ -480,7 +486,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     if not delivery_strategy:
         return None, "No shipping available", gw_name, None
 
-    # Step 2: Negotiate with selected delivery + empty payment to lock in delivery details
+    # Step 2: Negotiate with selected delivery + payment to get payment methods
     step2_vars = _make_vars()
     step2_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
     step2_vars['payment'] = {'totalAmount': {'any': True}, 'paymentLines': [], 'billingAddress': {'streetAddress': addr_block}}
@@ -492,6 +498,28 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
             running_total, currency, tax_amount, _, delivery_strategy, shipping_amount, api_pmi2, api_gw2 = _parse_seller(sp2)
             if api_pmi2 and not payment_method_id: payment_method_id = api_pmi2
             if api_gw2: gw_name = api_gw2
+            logger.info(f"[STEP2] pmi={api_pmi2} gw={api_gw2} total={running_total}")
+
+    # If still no payment method, try one more negotiate with payment any
+    if not payment_method_id:
+        logger.info("[STEP2] No payment method found, trying additional negotiate...")
+        step2b_vars = _make_vars()
+        step2b_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
+        step2b_vars['payment'] = {'totalAmount': {'any': True}, 'paymentLines': [{'paymentMethod': {'directPaymentMethod': {'paymentMethodIdentifier': 'shopify_payments', 'sessionId': '', 'billingAddress': {'streetAddress': addr_block}}}, 'amount': {'value': {'amount': running_total, 'currencyCode': currency}}, 'dueAt': None}], 'billingAddress': {'streetAddress': addr_block}}
+        result2b = await _negotiate(client, graphql_url, gql_headers, step2b_vars)
+        _update_qt(result2b)
+        if result2b and isinstance(result2b, dict) and result2b.get('__typename') == 'NegotiationResultAvailable':
+            sp2b = result2b.get('sellerProposal')
+            if sp2b and isinstance(sp2, dict):
+                _, _, _, _, _, _, api_pmi2b, api_gw2b = _parse_seller(sp2b)
+                if api_pmi2b: payment_method_id = api_pmi2b
+                if api_gw2b: gw_name = api_gw2b
+                logger.info(f"[STEP2B] pmi={api_pmi2b} gw={api_gw2b}")
+
+    if not payment_method_id:
+        # Try common Shopify payment method identifiers
+        payment_method_id = 'shopify_payments'
+        logger.info("[FALLBACK] Using default payment_method_id=shopify_payments")
 
     # Tokenize card
     year_full = f"20{yy}" if len(yy) == 2 else yy
