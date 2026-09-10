@@ -506,8 +506,33 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         return None, "Invalid card - vault failed", gw_name, None
 
-    # Step 6: Build payment input (use tax from negotiate step 1)
+    # Step 6: Build payment input
     payment_input = {'totalAmount': {'any': True}, 'paymentLines': [{'paymentMethod': {'directPaymentMethod': {'paymentMethodIdentifier': payment_method_id, 'sessionId': payment_token, 'billingAddress': {'streetAddress': addr_block}, 'cardSource': None}}, 'amount': {'value': {'amount': running_total, 'currencyCode': currency}}, 'dueAt': None}], 'billingAddress': {'streetAddress': addr_block}}
+    
+    # Do a negotiate with payment to get the final total (including tax)
+    step3_vars = _make_vars()
+    step3_vars['delivery'] = {
+        'deliveryLines': [{
+            'destination': {'streetAddress': addr_block},
+            'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}},
+            'targetMerchandiseLines': {'any': True},
+            'deliveryMethodTypes': ['SHIPPING'],
+            'expectedTotalPrice': {'any': True},
+            'destinationChanged': False,
+        }],
+        'noDeliveryRequired': [], 'useProgressiveRates': False,
+        'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
+    }
+    step3_vars['payment'] = payment_input
+    result3 = await _negotiate(client, graphql_url, gql_headers, step3_vars)
+    _update_qt(result3)
+    if result3 and isinstance(result3, dict) and result3.get('__typename') == 'NegotiationResultAvailable':
+        sp3 = result3.get('sellerProposal')
+        if sp3 and isinstance(sp3, dict):
+            running_total, currency, tax_amount, _, _, _, _, api_gw3, _ = _parse_seller(sp3)
+            if api_gw3: gw_name = api_gw3
+            payment_input['paymentLines'][0]['amount']['value']['amount'] = running_total
+            logger.info(f"[STEP3] tax={tax_amount} total={running_total} gw={api_gw3}")
 
     # Use saved delivery data if available, otherwise build new
     if saved_delivery_data[0]:
