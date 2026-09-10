@@ -771,11 +771,11 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
     if site:
         sites = [site.replace("https://", "").replace("http://", "").rstrip("/")]
     else:
-        # Always try teeinblue first (confirmed working), then random others
-        sites = ["www.teeinblue.com"]
-        other_sites = [s for s in SHOPIFY_SITES if s != "www.teeinblue.com"]
+        # Try confirmed working sites first, then random others
+        sites = ["couch-collectibles.myshopify.com", "www.teeinblue.com"]
+        other_sites = [s for s in SHOPIFY_SITES if s not in sites]
         random.shuffle(other_sites)
-        sites.extend(other_sites[:4])  # Try teeinblue + 4 others = 5 total
+        sites.extend(other_sites[:4])  # Try 2 confirmed + 4 others = 6 total
 
     for s in sites:
         logger.info(f"Checking {card_short} on {s} proxy={proxy_url is not None}")
