@@ -506,33 +506,8 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         return None, "Invalid card - vault failed", gw_name, None
 
-    # Step 6: Build payment input
+    # Step 6: Build payment input (use values from negotiate step 1)
     payment_input = {'totalAmount': {'any': True}, 'paymentLines': [{'paymentMethod': {'directPaymentMethod': {'paymentMethodIdentifier': payment_method_id, 'sessionId': payment_token, 'billingAddress': {'streetAddress': addr_block}, 'cardSource': None}}, 'amount': {'value': {'amount': running_total, 'currencyCode': currency}}, 'dueAt': None}], 'billingAddress': {'streetAddress': addr_block}}
-    
-    # Do a negotiate with payment to get the final total (including tax)
-    step3_vars = _make_vars()
-    step3_vars['delivery'] = {
-        'deliveryLines': [{
-            'destination': {'streetAddress': addr_block},
-            'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}},
-            'targetMerchandiseLines': {'any': True},
-            'deliveryMethodTypes': ['SHIPPING'],
-            'expectedTotalPrice': {'any': True},
-            'destinationChanged': False,
-        }],
-        'noDeliveryRequired': [], 'useProgressiveRates': False,
-        'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
-    }
-    step3_vars['payment'] = payment_input
-    result3 = await _negotiate(client, graphql_url, gql_headers, step3_vars)
-    _update_qt(result3)
-    if result3 and isinstance(result3, dict) and result3.get('__typename') == 'NegotiationResultAvailable':
-        sp3 = result3.get('sellerProposal')
-        if sp3 and isinstance(sp3, dict):
-            running_total, currency, tax_amount, _, _, _, _, api_gw3, _ = _parse_seller(sp3)
-            if api_gw3: gw_name = api_gw3
-            payment_input['paymentLines'][0]['amount']['value']['amount'] = running_total
-            logger.info(f"[STEP3] tax={tax_amount} total={running_total} gw={api_gw3}")
 
     # Use saved delivery data if available, otherwise build new
     if saved_delivery_data[0]:
@@ -616,14 +591,27 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
                     return None, "Declined - Invalid Card Number", gw_name, None
                 if any(k in codes_lower for k in ['gateway_unavailable', 'payment_method_unavailable']):
                     return None, "Payment method unavailable", gw_name, None
-                # Handle TAX_NEW_TAX_MUST_BE_ACCEPTED — retry with acceptUnexpectedDiscounts and tax from response
-                if 'tax_new_tax_must_be_accepted' in codes_lower or 'tax' in codes_lower:
-                    # Try to extract new tax from the response
-                    try:
-                        new_tax = '0'
-                        for e in errors:
-                            if isinstance(e, dict) and e.get('code', '').startswith('TAX'):
-                                # Retry submit
+                # Handle TAX error — negotiate with payment to get final total, then retry
+                if 'tax' in codes_lower or 'tax_new_tax' in codes_lower:
+                    logger.info(f"[TAX_ERROR] Retrying with negotiate to get final tax...")
+                    # Negotiate with payment (no card token) to get final total
+                    tax_vars = _make_vars()
+                    tax_vars['delivery'] = submit_delivery
+                    tax_vars['payment'] = {'totalAmount': {'any': True}, 'paymentLines': [], 'billingAddress': {'streetAddress': addr_block}}
+                    tax_result = await _negotiate(client, graphql_url, gql_headers, tax_vars)
+                    _update_qt(tax_result)
+                    if tax_result and isinstance(tax_result, dict) and tax_result.get('__typename') == 'NegotiationResultAvailable':
+                        sp_tax = tax_result.get('sellerProposal')
+                        if sp_tax and isinstance(sp_tax, dict):
+                            new_total, _, new_tax, _, _, _, _, _, _ = _parse_seller(sp_tax)
+                            if new_total and new_total != '0':
+                                running_total = new_total
+                                tax_amount = new_tax
+                                payment_input['paymentLines'][0]['amount']['value']['amount'] = running_total
+                                completion_vars['input']['payment'] = payment_input
+                                completion_vars['input']['taxes']['proposedTotalAmount']['value']['amount'] = tax_amount
+                                completion_vars['input']['queueToken'] = latest_qt[0]
+                                logger.info(f"[TAX_FIX] new total={running_total} tax={tax_amount}")
                                 text = await _do_submit()
                                 try:
                                     resp_json2 = json.loads(text)
@@ -636,9 +624,6 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
                                         return running_total, f"Declined - {', '.join(codes2[:2])}", gw_name, None
                                 except:
                                     pass
-                                break
-                    except:
-                        pass
                 if 'delivery_line_detail_changed' in codes_lower:
                     submit_delivery['deliveryLines'][0]['destinationChanged'] = True
                     completion_vars['input']['delivery'] = submit_delivery
