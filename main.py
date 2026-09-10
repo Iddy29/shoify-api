@@ -480,8 +480,18 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     if not delivery_strategy:
         return None, "No shipping available", gw_name, None
 
-    # Skip step 2 and 3 negotiate — go directly to tokenize and submit
-    # This avoids the delivery detail mismatch between negotiate steps
+    # Step 2: Negotiate with selected delivery + empty payment to lock in delivery details
+    step2_vars = _make_vars()
+    step2_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
+    step2_vars['payment'] = {'totalAmount': {'any': True}, 'paymentLines': [], 'billingAddress': {'streetAddress': addr_block}}
+    result2 = await _negotiate(client, graphql_url, gql_headers, step2_vars)
+    _update_qt(result2)
+    if result2 and isinstance(result2, dict) and result2.get('__typename') == 'NegotiationResultAvailable':
+        sp2 = result2.get('sellerProposal')
+        if sp2 and isinstance(sp2, dict):
+            running_total, currency, tax_amount, _, delivery_strategy, shipping_amount, api_pmi2, api_gw2 = _parse_seller(sp2)
+            if api_pmi2 and not payment_method_id: payment_method_id = api_pmi2
+            if api_gw2: gw_name = api_gw2
 
     # Tokenize card
     year_full = f"20{yy}" if len(yy) == 2 else yy
@@ -502,12 +512,8 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         pass
 
-    # Submit order — use the same delivery format as the negotiate step 1
-    # This ensures the delivery details match exactly what was negotiated
-    submit_delivery = _build_delivery()
-    # But set destinationChanged to False since address hasn't changed
-    submit_delivery['deliveryLines'][0]['destinationChanged'] = False
-    submit_delivery['deliveryLines'][0]['destination'] = {'streetAddress': addr_block}
+    # Submit order — use EXACT same delivery as step 2 negotiate
+    submit_delivery = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
     checkout_token = re.search(r'/checkouts/cn/([^/]+)', checkout_url)
     attempt_token = checkout_token.group(1) if checkout_token else checkout_url.split('/')[-1].split('?')[0]
