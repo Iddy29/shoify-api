@@ -577,6 +577,22 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
                     return None, "Payment method unavailable", gw_name, None
                 if any(k in codes_lower for k in ['invalid_variable', 'validation_custom', 'artifact_dissatisfaction', 'input_validation_error']):
                     return None, f"Gateway Error - {codes_str}", gw_name, None
+                if 'delivery_line_detail_changed' in codes_lower:
+                    # Retry submit with destinationChanged=True
+                    submit_delivery = _build_delivery()
+                    completion_vars['input']['delivery'] = submit_delivery
+                    text = await _do_submit()
+                    try:
+                        resp_json2 = json.loads(text)
+                        submit_data2 = resp_json2.get('data', {}).get('submitForCompletion', {})
+                        typename2 = submit_data2.get('__typename', '')
+                        if typename2 in ('SubmitSuccess', 'SubmitAlreadyAccepted', 'SubmittedForCompletion'):
+                            receipt_id = submit_data2.get('receipt', {}).get('id')
+                        elif typename2 == 'SubmitRejected':
+                            codes2 = [e.get('code', '') for e in submit_data2.get('errors', []) if isinstance(e, dict)]
+                            return running_total, f"Declined - {', '.join(codes2[:2])}", gw_name, None
+                    except:
+                        pass
                 return running_total, f"Declined - {codes_str}", gw_name, None
 
         if typename in ('SubmitSuccess', 'SubmitAlreadyAccepted', 'SubmittedForCompletion'):
