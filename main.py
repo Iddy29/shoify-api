@@ -480,17 +480,8 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     if not delivery_strategy:
         return None, "No shipping available", gw_name, None
 
-    step2_vars = _make_vars()
-    step2_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
-    step2_vars['payment'] = {'totalAmount': {'any': True}, 'paymentLines': [], 'billingAddress': {'streetAddress': addr_block}}
-    result2 = await _negotiate(client, graphql_url, gql_headers, step2_vars)
-    _update_qt(result2)
-    if result2 and isinstance(result2, dict) and result2.get('__typename') == 'NegotiationResultAvailable':
-        sp2 = result2.get('sellerProposal')
-        if sp2 and isinstance(sp2, dict):
-            running_total, currency, tax_amount, _, delivery_strategy, shipping_amount, api_pmi2, api_gw2 = _parse_seller(sp2)
-            if api_pmi2 and not payment_method_id: payment_method_id = api_pmi2
-            if api_gw2: gw_name = api_gw2
+    # Skip step 2 and 3 negotiate — go directly to tokenize and submit
+    # This avoids the delivery detail mismatch between negotiate steps
 
     # Tokenize card
     year_full = f"20{yy}" if len(yy) == 2 else yy
@@ -505,20 +496,9 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         return None, "Invalid card - vault failed", gw_name, None
 
-    # Submit payment
+    # Submit payment — build payment input directly (no step 3 negotiate)
     try:
         payment_input = {'totalAmount': {'any': True}, 'paymentLines': [{'paymentMethod': {'directPaymentMethod': {'paymentMethodIdentifier': payment_method_id, 'sessionId': payment_token, 'billingAddress': {'streetAddress': addr_block}, 'cardSource': None}}, 'amount': {'value': {'amount': running_total, 'currencyCode': currency}}, 'dueAt': None}], 'billingAddress': {'streetAddress': addr_block}}
-        step3_vars = _make_vars()
-        step3_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
-        step3_vars['payment'] = payment_input
-        result3 = await _negotiate(client, graphql_url, gql_headers, step3_vars)
-        _update_qt(result3)
-        if result3 and isinstance(result3, dict) and result3.get('__typename') == 'NegotiationResultAvailable':
-            sp3 = result3.get('sellerProposal')
-            if sp3 and isinstance(sp3, dict):
-                running_total, currency, tax_amount, _, delivery_strategy, shipping_amount, _, api_gw3 = _parse_seller(sp3)
-                if api_gw3: gw_name = api_gw3
-                payment_input['paymentLines'][0]['amount']['value']['amount'] = running_total
     except Exception:
         pass
 
