@@ -779,7 +779,7 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
         sites = [site.replace("https://", "").replace("http://", "").rstrip("/")]
     else:
         # Try teeinblue first (clean checkout), then couch-collectibles, then others
-        sites = ["www.teeinblue.com", "couch-collectibles.myshopify.com"]
+        sites = ["couch-collectibles.myshopify.com", "www.teeinblue.com"]
         other_sites = [s for s in SHOPIFY_SITES if s not in sites]
         random.shuffle(other_sites)
         sites.extend(other_sites[:4])
