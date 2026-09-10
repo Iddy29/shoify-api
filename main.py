@@ -502,9 +502,12 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         pass
 
-    # Submit order - use the exact same delivery block from negotiate
-    # to avoid DELIVERY_LINE_DETAIL_CHANGED error
-    submit_delivery = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
+    # Submit order — use the same delivery format as the negotiate step 1
+    # This ensures the delivery details match exactly what was negotiated
+    submit_delivery = _build_delivery()
+    # But set destinationChanged to False since address hasn't changed
+    submit_delivery['deliveryLines'][0]['destinationChanged'] = False
+    submit_delivery['deliveryLines'][0]['destination'] = {'streetAddress': addr_block}
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
     checkout_token = re.search(r'/checkouts/cn/([^/]+)', checkout_url)
     attempt_token = checkout_token.group(1) if checkout_token else checkout_url.split('/')[-1].split('?')[0]
