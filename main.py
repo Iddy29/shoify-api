@@ -366,9 +366,11 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv, proxy_url=None):
         except:
             return None, "Failed to get session", gw_name, None
         
-        # Step 2: Find product
+        # Step 2: Find product — try multiple endpoints
         try:
-            r = session.get(f"{base_url}/products.json?limit=10", timeout=10)
+            r = session.get(f"{base_url}/products.json?limit=10", timeout=10, allow_redirects=True)
+            if r.status_code != 200:
+                r = session.get(f"{base_url}/collections/all/products.json?limit=10", timeout=10, allow_redirects=True)
             if r.status_code != 200:
                 return None, "No products", gw_name, None
             data = r.json()
