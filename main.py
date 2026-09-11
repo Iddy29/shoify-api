@@ -383,12 +383,6 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         return None, "Failed to add to cart", gw_name, None
 
-    # View cart page (simulates browser navigation before checkout)
-    try:
-        await client.get(f"{base_url}/cart", headers={'Accept': 'text/html', 'User-Agent': UA}, timeout=httpx.Timeout(5))
-    except:
-        pass
-
     # Step 3: Create checkout
     ch_headers = {'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9'}
     try:
