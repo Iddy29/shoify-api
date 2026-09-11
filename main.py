@@ -408,6 +408,15 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
         'lineComponentsSource': None, 'lineComponents': [],
     }
 
+    # Generate ONE fingerprint and use it for both negotiate and submit
+    checkout_fingerprint = {
+        'signature': '',
+        'signatureUuid': '',
+        'lineItemScriptChanges': [],
+        'paymentScriptChanges': [],
+        'shippingScriptChanges': [],
+    }
+
     common_vars = {
         'sessionInput': {'sessionToken': sst}, 'queueToken': queue_token,
         'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
@@ -417,7 +426,7 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
         'taxes': {'proposedAllocations': None, 'proposedTotalAmount': {'value': {'amount': '0', 'currencyCode': currency}}, 'proposedTotalIncludedAmount': None, 'proposedMixedStateTotalAmount': None, 'proposedExemptions': []},
         'note': {'message': None, 'customAttributes': []}, 'localizationExtension': {'fields': []},
         'nonNegotiableTerms': None,
-        'scriptFingerprint': _generate_script_fingerprint(), 'optionalDuties': {'buyerRefusesDuties': False},
+        'scriptFingerprint': checkout_fingerprint, 'optionalDuties': {'buyerRefusesDuties': False},
     }
 
     latest_qt = [queue_token]
@@ -568,14 +577,8 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
             'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
         }
 
-    # Use empty fingerprint object — matches what Shopify checkout JS sends when no scripts are loaded
-    submit_fingerprint = {
-        'signature': '',
-        'signatureUuid': '',
-        'lineItemScriptChanges': [],
-        'paymentScriptChanges': [],
-        'shippingScriptChanges': [],
-    }
+    # Use the SAME fingerprint as negotiate
+    submit_fingerprint = checkout_fingerprint
 
     # Step 7: Submit order
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
