@@ -346,9 +346,8 @@ async def _negotiate(client, graphql_url, headers, variables):
     return {'__typename': 'NegotiationResultFailed'}
 
 
-async def _shopify_check(client, domain, cc, mm, yy, cvv):
-    """Run Shopify checkout using requests.Session (synchronous) in a thread.
-    This matches the reference script's approach and avoids httpx TLS fingerprint issues."""
+async def _shopify_check(client, domain, cc, mm, yy, cvv, proxy_url=None):
+    """Run Shopify checkout using requests.Session (synchronous) in a thread."""
     def _sync_check():
         domain_clean = domain.replace('https://', '').replace('http://', '').strip('/')
         base_url = f"https://{domain_clean}"
@@ -358,6 +357,8 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
         session = requests.Session()
         session.headers.update({'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9'})
         session.verify = False
+        if proxy_url:
+            session.proxies = {'http': proxy_url, 'https': proxy_url}
         
         # Step 1: Get initial session
         try:
@@ -1318,7 +1319,7 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
             if proxy_url:
                 client_kwargs["proxy"] = proxy_url
             async with httpx.AsyncClient(**client_kwargs) as client:
-                result = await asyncio.wait_for(_shopify_check(client, s, cc, mm, yy, cvv), timeout=30)
+                result = await asyncio.wait_for(_shopify_check(client, s, cc, mm, yy, cvv, proxy_url=proxy_url), timeout=30)
                 amount, response, gw_name = result[0], result[1], result[2]
                 extra = result[3] if len(result) > 3 else None
                 elapsed = round(time.time() - start, 2)
