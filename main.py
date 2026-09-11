@@ -568,9 +568,14 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv):
             'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True,
         }
 
-    # Use None for script fingerprint — Shopify's new checkout doesn't require it
-    # Sending a random fingerprint causes ARTIFACT_DISSATISFACTION
-    submit_fingerprint = None
+    # Use empty fingerprint object — matches what Shopify checkout JS sends when no scripts are loaded
+    submit_fingerprint = {
+        'signature': '',
+        'signatureUuid': '',
+        'lineItemScriptChanges': [],
+        'paymentScriptChanges': [],
+        'shippingScriptChanges': [],
+    }
 
     # Step 7: Submit order
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
