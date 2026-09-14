@@ -786,14 +786,14 @@ async def check(req: CheckRequest):
     try:
         result = await asyncio.wait_for(
             check_card(req.cc, req.mm, req.yy, req.cvv, site=req.site, sites=req.sites, proxy=req.proxy),
-            timeout=45
+            timeout=35
         )
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - check_start
-        logger.info(f"[check] {req.cc} verdict=UNTESTED elapsed={elapsed:.1f}s (45s hard timeout)")
+        logger.info(f"[check] {req.cc} verdict=UNTESTED elapsed={elapsed:.1f}s (35s hard timeout)")
         return {
             "status": "error",
-            "response": "UNTESTED - Hard 45s timeout. Store or proxy too slow. Bank never responded.",
+            "response": "UNTESTED - Hard 35s timeout. Store or proxy too slow. Bank never responded.",
             "gateway": "Shopify Payments",
             "amount": None,
             "site": req.site or None,
