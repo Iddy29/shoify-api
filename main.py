@@ -800,6 +800,30 @@ async def check(req: CheckRequest):
             "elapsed": round(elapsed, 2),
             "verdict": "UNTESTED",
         }
+    except asyncio.CancelledError:
+        elapsed = time.monotonic() - check_start
+        logger.info(f"[check] {req.cc} verdict=UNTESTED elapsed={elapsed:.1f}s (cancelled)")
+        return {
+            "status": "error",
+            "response": "UNTESTED - Request cancelled. Bank never responded.",
+            "gateway": "Shopify Payments",
+            "amount": None,
+            "site": req.site or None,
+            "elapsed": round(elapsed, 2),
+            "verdict": "UNTESTED",
+        }
+    except Exception as e:
+        elapsed = time.monotonic() - check_start
+        logger.info(f"[check] {req.cc} verdict=UNTESTED elapsed={elapsed:.1f}s (error: {str(e)[:80]})")
+        return {
+            "status": "error",
+            "response": f"UNTESTED - Error: {str(e)[:80]}. Bank never responded.",
+            "gateway": "Shopify Payments",
+            "amount": None,
+            "site": req.site or None,
+            "elapsed": round(elapsed, 2),
+            "verdict": "UNTESTED",
+        }
     
     elapsed = time.monotonic() - check_start
     logger.info(f"[check] {req.cc} verdict={result.get('verdict', '?')} elapsed={elapsed:.1f}s")
