@@ -1311,7 +1311,7 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
     logger.info(f"[CHECK] card={card_short} site={site} proxy={'YES' if proxy_url else 'NO'}")
 
     def _is_skip(resp):
-        skip = ["No products", "No session", "No shipping", "Checkpoint", "login", "password", "Throttled", "Gateway Error", "Negotiation", "Processing error", "No receipt", "Invalid card", "Failed to"]
+        skip = ["No products", "No session", "No shipping", "Checkpoint", "login", "password", "Throttled", "Gateway Error", "Negotiation", "Processing error", "No receipt", "Invalid card"]
         return any(k.lower() in (resp or "").lower() for k in skip)
 
     if site:
