@@ -355,18 +355,10 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv, proxy_url=None):
     gw_name = 'Shopify Payments'
     UA = _get_ua()
     
-    # Step 1: Get initial session (cart.js sets cookies)
-    try:
-        resp = await client.get(f"{base_url}/cart.js", timeout=httpx.Timeout(10))
-        logger.info(f"[STEP1] cart.js: {resp.status_code}")
-    except Exception as e:
-        logger.info(f"[STEP1] ERROR: {str(e)[:60]}")
-        return None, "Failed to get session", gw_name, None
-    
-    # Step 2: Find product
+    # Step 1: Find product (skip cart.js — not needed for all stores)
     try:
         resp = await client.get(f"{base_url}/products.json?limit=10", timeout=httpx.Timeout(10))
-        logger.info(f"[STEP2] products.json: {resp.status_code}")
+        logger.info(f"[STEP1] products.json: {resp.status_code}")
         if resp.status_code != 200:
             resp = await client.get(f"{base_url}/collections/all/products.json?limit=10", timeout=httpx.Timeout(10))
         if resp.status_code != 200:
