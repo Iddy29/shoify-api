@@ -152,7 +152,7 @@ def _parse_bank_response(text):
         pe = receipt.get('processingError', {})
         resp['response_code'] = pe.get('code', '')
         resp['transaction_id'] = receipt.get('id', '')
-    except:
+    except Exception:
         pass
     return resp
 
@@ -171,7 +171,7 @@ def _parse_products(data):
                 if 0 < price < min_price:
                     min_price = price
                     best = {'price': f"{price:.2f}", 'variant_id': str(variant['id']), 'handle': product['handle']}
-            except:
+            except Exception:
                 continue
     if not best:
         for product in products:
@@ -180,7 +180,7 @@ def _parse_products(data):
                     try:
                         price = float(str(variant.get('price', '0')).replace(',', ''))
                         best = {'price': f"{price:.2f}", 'variant_id': str(variant['id']), 'handle': product['handle']}
-                    except:
+                    except Exception:
                         continue
     return best
 
@@ -234,7 +234,7 @@ async def _negotiate(session, graphql_url, headers, variables):
             if not result or not isinstance(result, dict):
                 result = negotiate
             return result
-        except:
+        except Exception:
             if attempt < 2:
                 await asyncio.sleep(0.3)
                 continue
@@ -259,7 +259,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                     product = _parse_products(data)
                     if product:
                         break
-        except:
+        except Exception:
             continue
     if not product:
         return None, "No products available", gw_name, {'verdict': 'UNTESTED'}
@@ -276,7 +276,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         async with session.post(f"{base_url}/cart/add.js", json={'id': int(variant_id)}, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
             if resp.status != 200:
                 return None, "Failed to add to cart", gw_name, {'verdict': 'UNTESTED'}
-    except:
+    except Exception:
         return None, "Failed to add to cart", gw_name, {'verdict': 'UNTESTED'}
 
     # Create checkout
@@ -285,7 +285,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         async with session.post(f"{base_url}/checkout/", headers=ch_headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             checkout_url = str(resp.url)
             text = await resp.text()
-    except:
+    except Exception:
         return None, "Failed to create checkout", gw_name, {'verdict': 'UNTESTED'}
 
     if 'login' in checkout_url.lower() or 'password' in checkout_url.lower():
@@ -422,7 +422,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                 running_total, currency, tax_amount, _, delivery_strategy, shipping_amount, _, api_gw3 = _parse_seller(sp3)
                 if api_gw3: gw_name = api_gw3
                 payment_input['paymentLines'][0]['amount']['value']['amount'] = running_total
-    except:
+    except Exception:
         pass
 
     # Submit order
@@ -437,7 +437,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         try:
             r = await session.post(graphql_url, json={'query': SUBMIT_QUERY, 'variables': completion_vars, 'operationName': 'SubmitForCompletion'}, headers=gql_headers, timeout=aiohttp.ClientTimeout(total=8))
             return await r.text()
-        except:
+        except Exception:
             return '{"error":"submit_timeout"}'
 
     text = await _do_submit()
@@ -478,7 +478,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                     receipt_id = submit_data['receipt']['id']
                 else:
                     return None, "UNTESTED - Throttled. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
-            except:
+            except Exception:
                 return None, "UNTESTED - Throttled. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
         elif typename == 'CheckpointDenied':
             return None, "UNTESTED - Checkpoint denied. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
@@ -536,7 +536,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                 error_message = pe.get('messageUntranslated', '') or ''
             elif receipt_typename == 'ProcessedReceipt':
                 return running_total, "APPROVED CHARGED - Order created — money moved", gw_name, {'amount': running_total, 'verdict': 'APPROVED_CHARGED'}
-    except:
+    except Exception:
         pass
 
     if not code:
