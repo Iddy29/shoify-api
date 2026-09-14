@@ -1306,7 +1306,7 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
     for s in sites:
         logger.info(f"Checking {card_short} on {s} proxy={proxy_url is not None}")
         try:
-            client_kwargs = {"timeout": httpx.Timeout(25), "follow_redirects": True, "verify": False, "headers": {"User-Agent": _get_ua()}, "cookies": {}}
+            client_kwargs = {"timeout": httpx.Timeout(25), "follow_redirects": True, "verify": False, "headers": {"User-Agent": _get_ua()}}
             if proxy_url:
                 client_kwargs["proxy"] = proxy_url
             async with httpx.AsyncClient(**client_kwargs) as client:
