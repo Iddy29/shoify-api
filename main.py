@@ -521,10 +521,10 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
             return None, "UNTESTED - Bank timeout, no receipt", gw_name, {'amount': running_total, 'verdict': 'UNTESTED'}
 
     if 'ActionRequiredReceipt' in text:
-        return running_total, "APPROVED 3DS - Card live, 3DS passed, verify manually", gw_name, {'amount': running_total, 'verdict': 'APPROVED_3DS'}
+        return running_total, "APPROVED 3DS - Card live, 3DS passed, order unconfirmed — verify manually", gw_name, {'amount': running_total, 'verdict': 'APPROVED_3DS'}
 
     if 'ProcessedReceipt' in text and 'processingError' not in text.lower() and 'FailedReceipt' not in text:
-        return running_total, "APPROVED CHARGED - Order created, money moved", gw_name, {'amount': running_total, 'verdict': 'APPROVED_CHARGED'}
+        return running_total, "APPROVED CHARGED - Order created — money moved", gw_name, {'amount': running_total, 'verdict': 'APPROVED_CHARGED'}
 
     # Parse bank code from FailedReceipt
     code = None
@@ -540,7 +540,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                 code = pe.get('code', '') or ''
                 error_message = pe.get('messageUntranslated', '') or ''
             elif receipt_typename == 'ProcessedReceipt':
-                return running_total, "APPROVED CHARGED - Order created, money moved", gw_name, {'amount': running_total, 'verdict': 'APPROVED_CHARGED'}
+                return running_total, "APPROVED CHARGED - Order created — money moved", gw_name, {'amount': running_total, 'verdict': 'APPROVED_CHARGED'}
     except:
         pass
 
@@ -550,13 +550,31 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         error_message = _extract_between(text, '"messageUntranslated":"', '"') or ''
 
     tl = (text + (code or '') + (error_message or '')).lower()
+    code_lower = (code or '').lower()
     logger.info(f"Poll result: typename={receipt_typename} code={code} msg={error_message[:80]}")
 
     if 'ActionRequiredReceipt' in text:
-        return running_total, "APPROVED 3DS - Card live, 3DS passed, verify manually", gw_name, {'amount': running_total, 'verdict': 'APPROVED_3DS'}
+        return running_total, "APPROVED 3DS - Card live, 3DS passed, order unconfirmed — verify manually", gw_name, {'amount': running_total, 'verdict': 'APPROVED_3DS'}
 
-    # ── CLASSIFY BY BANK CODE ─────────────────────────────────────────────
+    # ── CLASSIFY BY BANK CODE — per spec ─────────────────────────────────
 
+    # RULE 5: UNTESTED — bank never spoke
+    UNTESTED_CODES = {
+        'generic_error': 'Generic error — bank never spoke',
+        'processing_error': 'Bank processing error — bank never spoke',
+        'try_again_later': 'Bank says try again later — bank never spoke',
+        'system_malfunction': 'System malfunction — bank never spoke',
+        'issuer_not_available': 'Issuer unavailable — bank never spoke',
+    }
+    for k, reason in UNTESTED_CODES.items():
+        if k in tl:
+            return None, f"UNTESTED - {reason}", gw_name, {'verdict': 'UNTESTED', 'code': code}
+
+    # If receipt never came back (still Processing/Waiting after all polls)
+    if not code and ('ProcessingReceipt' in text or 'WaitingReceipt' in text):
+        return None, "UNTESTED - Poll timeout, no receipt", gw_name, {'verdict': 'UNTESTED'}
+
+    # RULE 2: APPROVED — card is LIVE, bank confirmed it exists
     APPROVED_LIVE_CODES = {
         'insufficient_funds': 'Card live, balance too low',
         'invalid_cvv': 'Card live, wrong CVV',
@@ -567,24 +585,17 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         'incorrect_zip': 'Card live, address mismatch',
         'incorrect_address': 'Card live, address mismatch',
     }
+    for k, reason in APPROVED_LIVE_CODES.items():
+        if k in tl:
+            return running_total, f"APPROVED LIVE - {reason}", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
+    if any(k in tl for k in ['invalid_cvc', 'incorrect_cvc']):
+        return running_total, "APPROVED LIVE - Card live, wrong CVV", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
+    if 'zip' in tl and ('invalid' in tl or 'incorrect' in tl):
+        return running_total, "APPROVED LIVE - Card live, address mismatch", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
+    if any(k in tl for k in ['insuff', 'funds']):
+        return running_total, "APPROVED LIVE - Card live, balance too low", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
 
-    DECLINED_SOFT_CODES = {
-        'do_not_honor': 'Issuer refused silently',
-        'card_declined': 'Generic decline',
-        'generic_decline': 'Generic decline',
-        'generic_error': 'Generic error from bank',
-        'velocity_limit': 'Too many recent attempts',
-        'card_velocity_exceeded': 'Too many recent attempts',
-        'exceeds_limit': 'Over per-transaction limit',
-        'withdrawal_count_limit_exceeded': 'Too many recent attempts',
-        'restricted_card': 'Merchant category restricted',
-        'not_permitted': 'Merchant category blocked',
-        'transaction_not_allowed': 'Merchant category blocked',
-        'try_again_later': 'Bank says try again later',
-        'approve_with_id': 'Approved but needs verification',
-        'call_issuer': 'Bank says call issuer',
-    }
-
+    # RULE 4a: DECLINED HARD — card itself is finished
     DECLINED_HARD_CODES = {
         'stolen_card': 'Card reported stolen',
         'lost_card': 'Card reported lost',
@@ -597,46 +608,36 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         'security_violation': 'Security violation',
         'card_not_supported': 'Brand not accepted by store',
     }
-
-    UNTESTED_CODES = {
-        'processing_error': 'Bank processing error',
-        'issuer_not_available': 'Issuer unavailable',
-        'system_malfunction': 'System malfunction',
-    }
-
-    code_lower = (code or '').lower()
-
-    # APPROVED — card is LIVE, bank confirmed it
-    for k, reason in APPROVED_LIVE_CODES.items():
-        if k in tl:
-            return running_total, f"APPROVED LIVE - {reason}", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
-    if any(k in tl for k in ['invalid_cvc', 'incorrect_cvc']):
-        return running_total, "APPROVED LIVE - Card live, wrong CVV", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
-    if 'zip' in tl and ('invalid' in tl or 'incorrect' in tl):
-        return running_total, "APPROVED LIVE - Card live, address mismatch", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
-    if any(k in tl for k in ['insuff', 'funds']):
-        return running_total, "APPROVED LIVE - Card live, balance too low", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
-
-    # DECLINED HARD — card is finished
     for k, reason in DECLINED_HARD_CODES.items():
         if k in tl:
             return running_total, f"DECLINED HARD - {reason}", gw_name, {'amount': running_total, 'verdict': 'DECLINED_HARD', 'code': code}
 
-    # DECLINED SOFT — transaction refused, card may still be live
+    # RULE 4b: DECLINED SOFT — transaction refused, card may still be live
+    DECLINED_SOFT_CODES = {
+        'do_not_honor': 'Issuer refused silently',
+        'card_declined': 'Generic decline',
+        'generic_decline': 'Generic decline',
+        'velocity_limit': 'Too many recent attempts',
+        'card_velocity_exceeded': 'Too many recent attempts',
+        'exceeds_limit': 'Over per-transaction limit',
+        'withdrawal_count_limit_exceeded': 'Too many recent attempts',
+        'restricted_card': 'Merchant category restricted',
+        'not_permitted': 'Merchant category blocked',
+        'transaction_not_allowed': 'Merchant category blocked',
+        'approve_with_id': 'Approved but needs verification',
+        'call_issuer': 'Bank says call issuer',
+        'pin_attempts': 'Too many PIN tries',
+    }
     for k, reason in DECLINED_SOFT_CODES.items():
         if k in tl:
             return running_total, f"DECLINED SOFT - {reason}", gw_name, {'amount': running_total, 'verdict': 'DECLINED_SOFT', 'code': code}
 
-    # UNTESTED — bank never spoke
-    for k, reason in UNTESTED_CODES.items():
-        if k in tl:
-            return None, f"UNTESTED - {reason}", gw_name, {'verdict': 'UNTESTED', 'code': code}
+    # RULE 5: No code at all → UNTESTED (bank never spoke)
+    if not code or code_lower in ('', 'unknown', 'null', 'none'):
+        return None, "UNTESTED - No bank response received", gw_name, {'verdict': 'UNTESTED'}
 
-    # Generic error with no specific code → UNTESTED
-    if not code or code_lower in ('generic_error', 'unknown', ''):
-        return None, "UNTESTED - Bank timeout, no receipt", gw_name, {'verdict': 'UNTESTED'}
-
-    # Unknown code but card reached the bank → APPROVED LIVE (bank confirmed card exists)
+    # RULE 2 fallback: Unknown code but card reached the bank = APPROVED LIVE
+    # (bank confirmed the card exists by returning a code)
     return running_total, f"APPROVED LIVE - Card reached bank, code: {code}", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
 
 
@@ -682,16 +683,16 @@ async def check_card(cc, mm, yy, cvv, site=None, sites=None, proxy=None):
                     extra = result[3] if len(result) > 3 else None
                     elapsed_now = round(time.time() - start, 2)
 
-                    # UNTESTED verdicts = chain failed before reaching bank, try next site
-                    if response and response.startswith("UNTESTED"):
-                        logger.info(f"UNTESTED {s}: {response}")
+                    # Chain failures (before reaching bank) → try next site
+                    chain_failures = ["no products", "no session", "no shipping", "checkpoint", "login", "password", "throttled", "gateway error", "negotiation", "no receipt", "invalid card", "no seller", "failed to add", "failed to create", "site requires", "payment method unavailable"]
+                    if response and any(k in response.lower() for k in chain_failures):
+                        logger.info(f"CHAIN FAIL {s}: {response}")
                         continue
 
-                    # Skip chain failures (not bank verdicts)
-                    skip = ["No products", "No session", "No shipping", "Checkpoint", "login", "password", "Throttled", "Gateway Error", "Negotiation", "Processing error", "No receipt", "Invalid card"]
-                    if any(k.lower() in (response or "").lower() for k in skip):
-                        logger.info(f"SKIP {s}: {response}")
-                        continue
+                    # UNTESTED verdicts (bank timeout/processing) → return immediately, don't try more sites
+                    if response and response.startswith("UNTESTED"):
+                        verdict = extra.get('verdict', '') if extra else 'UNTESTED'
+                        return {"status": "untested", "response": response, "gateway": gw_name, "amount": amount, "site": s, "elapsed": elapsed_now, "verdict": verdict}
 
                     if _is_fake_gateway(gw_name):
                         continue
