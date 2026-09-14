@@ -581,21 +581,25 @@ async def check_card(cc, mm, yy, cvv, site=None, proxy=None):
             elif len(parts) == 2:
                 proxy_url = f"http://{parts[0]}:{parts[1]}"
 
-    if site:
-        sites = [site.replace("https://", "").replace("http://", "").rstrip("/")]
+    requested_site = site.replace("https://", "").replace("http://", "").rstrip("/") if site else None
+
+    if requested_site:
+        sites = [requested_site]
     else:
-        sites = SHOPIFY_SITES.copy()
-        random.shuffle(sites)
-        sites = sites[:6]
+        sites = []
+    
+    fallback_sites = SHOPIFY_SITES.copy()
+    random.shuffle(fallback_sites)
+    sites.extend(fallback_sites[:10])
 
     for s in sites:
         logger.info(f"Checking {card_short} on {s} proxy={proxy_url is not None}")
         try:
-            kw = {"timeout": aiohttp.ClientTimeout(total=15), "connector": aiohttp.TCPConnector(ssl=False)}
+            kw = {"timeout": aiohttp.ClientTimeout(total=20), "connector": aiohttp.TCPConnector(ssl=False, limit=0)}
             if proxy_url:
                 kw["proxy"] = proxy_url
             async with aiohttp.ClientSession(**kw) as session:
-                result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=18)
+                result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=25)
                 amount, response, gw_name = result[0], result[1], result[2]
                 extra = result[3] if len(result) > 3 else None
                 elapsed = round(time.time() - start, 2)
