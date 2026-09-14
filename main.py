@@ -708,7 +708,7 @@ async def check_card(cc, mm, yy, cvv, site=None, sites=None, proxy=None):
         for s in site_list:
             logger.info(f"Checking {card_short} on {s} proxy={use_proxy is not None}")
             try:
-                kw = {"timeout": aiohttp.ClientTimeout(total=10, connect=5, sock_connect=5, sock_read=8), "connector": aiohttp.TCPConnector(ssl=False, limit=0, force_close=True, enable_cleanup_cleanup=True)}
+                kw = {"timeout": aiohttp.ClientTimeout(total=10, connect=5, sock_connect=5, sock_read=8), "connector": aiohttp.TCPConnector(ssl=False, limit=0, force_close=True)}
                 if use_proxy:
                     kw["proxy"] = use_proxy
                 async with aiohttp.ClientSession(**kw) as session:
@@ -784,12 +784,11 @@ async def check(req: CheckRequest):
     logger.info(f"[check] {req.cc} proxy={bool(req.proxy)} - start")
     
     try:
-        task = asyncio.create_task(
-            check_card(req.cc, req.mm, req.yy, req.cvv, site=req.site, sites=req.sites, proxy=req.proxy)
+        result = await asyncio.wait_for(
+            check_card(req.cc, req.mm, req.yy, req.cvv, site=req.site, sites=req.sites, proxy=req.proxy),
+            timeout=35
         )
-        result = await asyncio.wait_for(asyncio.shield(task), timeout=35)
     except asyncio.TimeoutError:
-        task.cancel()
         elapsed = time.monotonic() - check_start
         logger.info(f"[check] {req.cc} verdict=UNTESTED elapsed={elapsed:.1f}s (35s hard timeout)")
         return {
