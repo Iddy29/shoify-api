@@ -498,12 +498,17 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv, proxy_url=None):
     }
     
     try:
-        resp = await client.post('https://checkout.pci.shopifyinc.com/sessions', json=vault_payload, headers=vault_headers, timeout=httpx.Timeout(10))
-        vault_data = resp.json()
-        if 'id' not in vault_data:
-            return None, "Invalid card - vault rejected", gw_name, None
-        payment_token = vault_data['id']
-    except:
+        vault_kwargs = {"timeout": httpx.Timeout(10), "verify": False, "headers": vault_headers}
+        if proxy_url:
+            vault_kwargs["proxy"] = proxy_url
+        async with httpx.AsyncClient(**vault_kwargs) as vault_client:
+            resp = await vault_client.post('https://checkout.pci.shopifyinc.com/sessions', json=vault_payload, timeout=httpx.Timeout(10))
+            vault_data = resp.json()
+            if 'id' not in vault_data:
+                return None, "Invalid card - vault rejected", gw_name, None
+            payment_token = vault_data['id']
+    except Exception as e:
+        logger.info(f"[VAULT] ERROR: {str(e)[:60]}")
         return None, "Invalid card - vault failed", gw_name, None
     
     # Step 7: Submit order with full payload
