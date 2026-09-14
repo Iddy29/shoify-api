@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 
 import httpx
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -360,17 +362,23 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv, proxy_url=None):
         if proxy_url:
             session.proxies = {'http': proxy_url, 'https': proxy_url}
         
+        logger.info(f"[SYNC] Starting checkout for {domain_clean} proxy={'YES' if proxy_url else 'NO'}")
+        
         # Step 1: Get initial session
         try:
             r = session.get(f"{base_url}/cart.js", timeout=10)
-        except:
+            logger.info(f"[STEP1] cart.js: {r.status_code}")
+        except Exception as e:
+            logger.info(f"[STEP1] ERROR: {str(e)[:60]}")
             return None, "Failed to get session", gw_name, None
         
-        # Step 2: Find product — try multiple endpoints
+        # Step 2: Find product
         try:
             r = session.get(f"{base_url}/products.json?limit=10", timeout=10, allow_redirects=True)
+            logger.info(f"[STEP2] products.json: {r.status_code}")
             if r.status_code != 200:
                 r = session.get(f"{base_url}/collections/all/products.json?limit=10", timeout=10, allow_redirects=True)
+                logger.info(f"[STEP2] collections products.json: {r.status_code}")
             if r.status_code != 200:
                 return None, "No products", gw_name, None
             data = r.json()
