@@ -521,7 +521,25 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     logger.info(f"Running total: {running_total} {currency}")
 
     if "Your order total has changed." in text:
+        # Re-negotiate to get updated tax/amount, then retry
+        try:
+            step_retry = _make_vars()
+            step_retry['delivery'] = _build_delivery() if '_build_delivery' in dir() else step3_vars.get('delivery', {})
+            step_retry['payment'] = payment_input
+            retry_result = await _negotiate(session, graphql_url, gql_headers, step_retry)
+            _update_qt(retry_result)
+            if retry_result and isinstance(retry_result, dict) and retry_result.get('__typename') == 'NegotiationResultAvailable':
+                sp_retry = retry_result.get('sellerProposal')
+                if sp_retry and isinstance(sp_retry, dict):
+                    running_total, currency, tax_amount, _, _, _, _, _, _ = _parse_seller(sp_retry)
+                    payment_input['paymentLines'][0]['amount']['value']['amount'] = running_total
+                    completion_vars['input']['taxes']['proposedTotalAmount']['value']['amount'] = tax_amount
+                    completion_vars['input']['payment'] = payment_input
+                    completion_vars['input']['queueToken'] = latest_qt[0]
+        except Exception:
+            pass
         text = await _do_submit()
+        logger.info(f"Re-submit after total change: {text[:300]}")
     if "The requested payment method is not available." in text:
         return None, "UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': 'PAYMENTS_METHOD', 'iso': '', 'meaning': 'Payment method unavailable. Bank never responded.'}
 
@@ -559,21 +577,39 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                     logger.info(f"Re-vault retry failed: {str(e)[:80]}")
 
             if codes and typename == 'SubmitRejected':
-                # If terms need to be accepted, retry with nonNegotiableTerms containing signature+contents
-                if any('TERM' in c.upper() or 'WAITING' in c.upper() for c in codes):
-                    logger.info(f"Terms required, retrying with terms data...")
-                    completion_vars['input']['nonNegotiableTerms'] = {'signature': str(uuid.uuid4()), 'contents': []}
-                    text = await _do_submit()
-                    logger.info(f"Re-submit after terms: {text[:300]}")
+                # Handle TAX_NEW_TAX_MUST_BE_ACCEPTED + PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT + WAITING_PENDING_TERMS
+                needs_retry = any(c in codes for c in ['TAX_NEW_TAX_MUST_BE_ACCEPTED', 'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT', 'WAITING_PENDING_TERMS'])
+                if needs_retry:
+                    logger.info(f"Submit rejected with tax/terms changes, re-negotiating and retrying...")
                     try:
-                        resp_json = json.loads(text)
-                        submit_data = resp_json.get('data', {}).get('submitForCompletion', {})
-                        typename = submit_data.get('__typename', '')
-                        if typename in ('SubmitSuccess', 'SubmitAlreadyAccepted', 'SubmittedForCompletion'):
-                            receipt_id = submit_data.get('receipt', {}).get('id')
-                            codes = []  # Skip reject handling
-                    except Exception:
-                        pass
+                        # Re-negotiate to get updated amounts
+                        step_retry = _make_vars()
+                        step_retry['delivery'] = _build_delivery()
+                        step_retry['payment'] = payment_input
+                        retry_result = await _negotiate(session, graphql_url, gql_headers, step_retry)
+                        _update_qt(retry_result)
+                        if retry_result and isinstance(retry_result, dict) and retry_result.get('__typename') == 'NegotiationResultAvailable':
+                            sp_retry = retry_result.get('sellerProposal')
+                            if sp_retry and isinstance(sp_retry, dict):
+                                running_total, currency, tax_amount, _, _, _, _, _, _ = _parse_seller(sp_retry)
+                                payment_input['paymentLines'][0]['amount']['value']['amount'] = running_total
+                                completion_vars['input']['taxes']['proposedTotalAmount']['value']['amount'] = tax_amount
+                                completion_vars['input']['payment'] = payment_input
+                                completion_vars['input']['queueToken'] = latest_qt[0]
+                        # Retry submit
+                        text = await _do_submit()
+                        logger.info(f"Re-submit after tax/terms fix: {text[:300]}")
+                        try:
+                            resp_json = json.loads(text)
+                            submit_data = resp_json.get('data', {}).get('submitForCompletion', {})
+                            typename = submit_data.get('__typename', '')
+                            if typename in ('SubmitSuccess', 'SubmitAlreadyAccepted', 'SubmittedForCompletion'):
+                                receipt_id = submit_data.get('receipt', {}).get('id')
+                                codes = []  # Skip reject handling
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.info(f"Tax/terms retry failed: {str(e)[:80]}")
 
             if codes and typename == 'SubmitRejected':
                 # Distinguish between checkout errors (UNTESTED) and card decline (DECLINED)
