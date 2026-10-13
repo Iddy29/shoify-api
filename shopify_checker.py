@@ -93,9 +93,6 @@ async def shopify_check(cc, mm, yy, cvv, site=None, proxy=None):
     sites = [site] if site else SHOPIFY_SITES.copy()
     if not site: random.shuffle(sites)
     
-    kw = {"timeout": aiohttp.ClientTimeout(total=20), "connector": aiohttp.TCPConnector(ssl=False, limit=50)}
-    if proxy: kw["proxy"] = proxy
-    
     for s in sites[:3]:
         await asyncio.sleep(0.5)  # Delay to avoid rate limit
         s = s.replace("https://","").replace("http://","").rstrip("/")
@@ -111,7 +108,11 @@ async def shopify_check(cc, mm, yy, cvv, site=None, proxy=None):
 async def _check_site(cc, mm, yy, cvv, year_full, domain, proxy, kw, start):
     base = f"https://{domain}"
     
-    async with aiohttp.ClientSession(**kw) as session:
+    # Create fresh session for each site
+    session_kw = {"timeout": aiohttp.ClientTimeout(total=20), "connector": aiohttp.TCPConnector(ssl=False, limit=10, force_close=True)}
+    if proxy: session_kw["proxy"] = proxy
+    
+    async with aiohttp.ClientSession(**session_kw) as session:
         # Step 1: Product
         product = None
         for ep in [f"{base}/products.json?limit=5", f"{base}/collections/all/products.json?limit=5"]:
