@@ -15,7 +15,8 @@ import logging
 from urllib.parse import urlparse, parse_qs, unquote
 
 import aiohttp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
+from shopify_checker import shopify_check as fixed_check, HTTPException
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message)s')
@@ -1091,100 +1092,35 @@ async def get_sites():
 # ── GET /shopify — Live Card Checker ──────────────────────────────────────
 @app.get("/shopify")
 async def shopify_get(site: str = None, cc: str = None, proxy: str = None):
-    if not site or not cc:
-        return {"error": "Missing required params: site, cc", "example": "/shopify?site=biggerfive.myshopify.com&cc=5555608113587131|04|28|896&proxy=ip:port:user:pass"}
+    """Shopify card checker - uses fixed shopify_checker.py"""
+    if not cc:
+        return {"Response": "ERROR", "message": "cc parameter required", "CC": "", "Price": "N/A", "Gate": "N/A", "Site": site or "N/A", "Charged": "False", "Approved": "False", "Time": "0.0s"}
     
-    # Parse card from cc|mm|yy|cvv format
     parts = cc.split("|")
-    if len(parts) != 4:
-        return {"error": "Invalid card format. Use: cc|mm|yy|cvv"}
-    card_num, mm, yy, cvv = parts
-    if len(yy) == 4:
-        yy = yy[2:]
-    mm = mm.zfill(2)
+    if len(parts) < 4:
+        return {"Response": "ERROR", "message": "Invalid format. Use: number|mm|yy|cvv", "CC": cc, "Price": "N/A", "Gate": "N/A", "Site": site or "N/A", "Charged": "False", "Approved": "False", "Time": "0.0s"}
     
-    check_start = time.monotonic()
-    logger.info(f"[shopify] {card_num} on {site} proxy={bool(proxy)} - start")
+    proxy_url = None
+    if proxy and proxy.strip():
+        proxy_url = proxy.strip()
+        if not proxy_url.startswith("http"):
+            proxy_url = f"http://{proxy_url}"
     
-    try:
-        result = await asyncio.wait_for(
-            check_card(card_num, mm, yy, cvv, site=site, proxy=proxy),
-            timeout=40
-        )
-    except asyncio.TimeoutError:
-        elapsed = time.monotonic() - check_start
-        return {
-            "Response": "UNTESTED",
-            "CC": cc,
-            "Price": "N/A",
-            "Gate": "Shopify Payments",
-            "Site": site,
-            "Charged": "False",
-            "Approved": "False",
-            "Time": f"{elapsed:.1f}s",
-        }
-    except Exception as e:
-        elapsed = time.monotonic() - check_start
-        return {
-            "Response": "UNTESTED",
-            "CC": cc,
-            "Price": "N/A",
-            "Gate": "Shopify Payments",
-            "Site": site,
-            "Charged": "False",
-            "Approved": "False",
-            "Time": f"{elapsed:.1f}s",
-        }
-    
-    elapsed = time.monotonic() - check_start
-    verdict = result.get("verdict", "")
-    code = result.get("code", "")
-    amount = result.get("amount", "N/A")
-    gw = result.get("gateway", "Shopify Payments")
-    result_site = result.get("site", site)
-    
-    charged = "True" if verdict == "APPROVED_CHARGED" else "False"
-    approved = "True" if verdict in ("APPROVED_CHARGED", "APPROVED_LIVE", "APPROVED_3DS") else "False"
-    
-    # Map generic codes to user-friendly names
-    RESPONSE_DISPLAY_MAP = {
-        'GENERIC_ERROR': 'CARD_DECLINED',
-        'GENERIC_DECLINE': 'CARD_DECLINED',
-        'CARD_DECLINED': 'CARD_DECLINED',
-        'DO_NOT_HONOR': 'DO_NOT_HONOR',
-        'INSUFFICIENT_FUNDS': 'INSUFFICIENT_FUNDS',
-        'INVALID_CVV': 'INVALID_CVV',
-        'CVV_FAILURE': 'INVALID_CVV',
-        'INCORRECT_CVC': 'INVALID_CVV',
-        'AVS_FAILURE': 'AVS_FAILURE',
-        'STOLEN_CARD': 'STOLEN_CARD',
-        'LOST_CARD': 'LOST_CARD',
-        'EXPIRED_CARD': 'EXPIRED_CARD',
-        'CARD_EXPIRED': 'EXPIRED_CARD',
-        'INVALID_ACCOUNT': 'INVALID_ACCOUNT',
-        'FRAUD_SUSPECTED': 'FRAUD_SUSPECTED',
-        'PICKUP_CARD': 'PICKUP_CARD',
-        'VELOCITY_LIMIT': 'VELOCITY_LIMIT',
-        'EXCEEDS_LIMIT': 'EXCEEDS_LIMIT',
-        'RESTRICTED_CARD': 'RESTRICTED_CARD',
-        'ORDER_CREATED': 'ORDER_CREATED',
-        '3DS_REQUIRED': '3DS_REQUIRED',
-    }
-    display_code = RESPONSE_DISPLAY_MAP.get(code, code) if code else result.get("response", "UNKNOWN")
+    result = await fixed_check(parts[0], parts[1], parts[2], parts[3], site=site, proxy=proxy_url)
     
     return {
-        "Response": display_code,
+        "Response": result.get("verdict", "UNTESTED"),
+        "message": result.get("message", ""),
+        "decline_code": result.get("code", ""),
         "CC": cc,
-        "Price": str(amount) if amount else "N/A",
-        "Gate": gw,
-        "Site": result_site or site,
-        "Charged": charged,
-        "Approved": approved,
-        "Time": f"{elapsed:.1f}s",
+        "Price": str(result.get("amount", "N/A")),
+        "Gate": result.get("gate", "Shopify Payments"),
+        "Site": result.get("site", site or "N/A"),
+        "Charged": "True" if result.get("verdict") == "APPROVED_CHARGED" else "False",
+        "Approved": "True" if "APPROVED" in result.get("verdict", "") else "False",
+        "Time": result.get("time", "0.0s")
     }
 
-# ── GET /check — Site Health Checker ──────────────────────────────────────
-@app.get("/check")
 async def check_get(site: str = None, cc: str = None, proxy: str = None):
     if not site or not cc:
         return {"error": "Missing required params: site, cc", "example": "/check?site=biggerfive.myshopify.com&cc=5555608113587131|04|28|896&proxy=ip:port:user:pass"}
