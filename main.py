@@ -16,7 +16,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 import aiohttp
 from fastapi import FastAPI
-from shopify_checker import shopify_check as fixed_check, HTTPException
+from shopify_checker import shopify_check as fixed_check
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message)s')
